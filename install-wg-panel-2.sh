@@ -1,0 +1,966 @@
+#!/bin/bash
+set -e
+export DEBIAN_FRONTEND=noninteractive
+
+GREEN='\033[0;32m'; CYAN='\033[0;36m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info()  { echo -e "${CYAN}[*]${NC} $1"; }
+ok()    { echo -e "${GREEN}[✓]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
+die()   { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+
+[[ $EUID -ne 0 ]] && die "باید با root اجرا شود: sudo bash install-wg-panel.sh"
+
+SERVER_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+info "IP سرور: $SERVER_IP"
+
+info "نصب پیش‌نیازها..."
+apt-get update -qq 2>&1 | tail -2
+apt-get install -y -qq curl wget nginx wireguard wireguard-tools python3 python3-pip python3-venv iproute2 iptables 2>&1 | tail -3
+ok "پیش‌نیازها نصب شد"
+
+NODE_VER=$(node -v 2>/dev/null | cut -d. -f1 | tr -d 'v' || echo 0)
+if [[ $NODE_VER -lt 18 ]]; then
+  info "نصب Node.js 20..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>&1 | tail -3
+  apt-get install -y -qq nodejs 2>&1 | tail -2
+fi
+ok "Node.js $(node -v) آماده"
+
+info "نصب Flask..."
+python3 -m venv /opt/wg-venv
+/opt/wg-venv/bin/pip install -q flask flask-cors
+ok "Flask نصب شد"
+
+info "تنظیم WireGuard..."
+sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+grep -qx "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+mkdir -p /etc/wireguard
+if [[ ! -f /etc/wireguard/server_private.key ]]; then
+  wg genkey | tee /etc/wireguard/server_private.key | wg pubkey > /etc/wireguard/server_public.key
+  chmod 600 /etc/wireguard/server_private.key
+fi
+SRV_PRIV=$(cat /etc/wireguard/server_private.key)
+SRV_PUB=$(cat /etc/wireguard/server_public.key)
+MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
+[[ -z "$MAIN_IF" ]] && MAIN_IF="eth0"
+if [[ ! -f /etc/wireguard/wg0.conf ]]; then
+cat > /etc/wireguard/wg0.conf << WGEOF
+[Interface]
+Address = 10.8.0.1/24
+ListenPort = 51820
+PrivateKey = ${SRV_PRIV}
+PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${MAIN_IF} -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${MAIN_IF} -j MASQUERADE
+WGEOF
+fi
+systemctl enable wg-quick@wg0 > /dev/null 2>&1
+systemctl restart wg-quick@wg0 2>/dev/null && ok "WireGuard wg0 فعال شد" || warn "wg0 راه‌اندازی نشد"
+
+info "ساخت API سرور..."
+mkdir -p /opt/wg-api
+
+cat > /opt/wg-api/app.py << 'PYEOF'
+#!/usr/bin/env python3
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import subprocess, json, os, time, threading
+
+app = Flask(__name__)
+CORS(app)
+
+DB_FILE  = "/opt/wg-api/peers.json"
+CFG_FILE = "/opt/wg-api/config.json"
+WG_IF    = "wg0"
+BASE_IP  = "10.8.0"
+
+def load_cfg():
+    d = {"admin_pass": "admin123"}
+    if os.path.exists(CFG_FILE):
+        try:
+            with open(CFG_FILE) as f: return {**d, **json.load(f)}
+        except: pass
+    return d
+
+def save_cfg(c):
+    with open(CFG_FILE, "w") as f: json.dump(c, f, indent=2)
+
+def load_db():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE) as f: return json.load(f)
+        except: pass
+    return {"peers": []}
+
+def save_db(db):
+    with open(DB_FILE, "w") as f: json.dump(db, f, indent=2)
+
+def next_ip():
+    db   = load_db()
+    used = {p["ip"] for p in db["peers"]}
+    for i in range(2, 255):
+        ip = f"{BASE_IP}.{i}"
+        if ip not in used: return ip
+    return None
+
+def gen_keypair():
+    priv = subprocess.check_output(["wg","genkey"]).decode().strip()
+    pub  = subprocess.check_output(["wg","pubkey"], input=priv.encode()).decode().strip()
+    return priv, pub
+
+def wg_add_peer(pubkey, ip):
+    subprocess.run(["wg","set",WG_IF,"peer",pubkey,"allowed-ips",f"{ip}/32"], check=True)
+    subprocess.run(["wg-quick","save",WG_IF], check=False, capture_output=True)
+
+def wg_remove_peer(pubkey):
+    subprocess.run(["wg","set",WG_IF,"peer",pubkey,"remove"], check=False, capture_output=True)
+    subprocess.run(["wg-quick","save",WG_IF], check=False, capture_output=True)
+
+def wg_active_peers():
+    try:
+        out = subprocess.check_output(["wg","show",WG_IF,"peers"], stderr=subprocess.DEVNULL).decode()
+        return set(out.strip().split())
+    except: return set()
+
+def wg_stats():
+    try:
+        out = subprocess.check_output(["wg","show",WG_IF,"transfer"], stderr=subprocess.DEVNULL).decode()
+        s = {}
+        for line in out.strip().splitlines():
+            p = line.split()
+            if len(p) >= 3: s[p[0]] = int(p[1]) + int(p[2])
+        return s
+    except: return {}
+
+def wg_handshakes():
+    try:
+        out = subprocess.check_output(["wg","show",WG_IF,"latest-handshakes"], stderr=subprocess.DEVNULL).decode()
+        h = {}
+        for line in out.strip().splitlines():
+            p = line.split()
+            if len(p) >= 2: h[p[0]] = int(p[1])
+        return h
+    except: return {}
+
+def tc_apply(ip, speed_kbps):
+    if speed_kbps <= 0: return
+    subprocess.run(f"tc qdisc del dev {WG_IF} root 2>/dev/null", shell=True)
+    subprocess.run(f"tc qdisc add dev {WG_IF} root handle 1: htb default 999", shell=True)
+    subprocess.run(f"tc class add dev {WG_IF} parent 1: classid 1:999 htb rate 10000mbit", shell=True)
+    mark = sum(int(x) for x in ip.split(".")) % 200 + 10
+    subprocess.run(f"tc class add dev {WG_IF} parent 1: classid 1:{mark} htb rate {speed_kbps}kbit ceil {speed_kbps}kbit", shell=True)
+    subprocess.run(f"tc filter add dev {WG_IF} parent 1: protocol ip prio 1 u32 match ip dst {ip}/32 flowid 1:{mark}", shell=True)
+
+def tc_remove(ip):
+    subprocess.run(f"tc qdisc del dev {WG_IF} root 2>/dev/null", shell=True)
+
+def is_expired(peer):
+    """بررسی انقضای کاربر"""
+    exp = peer.get("expiresAt", 0)
+    if not exp or exp <= 0: return False   # بدون تاریخ انقضا
+    return int(time.time() * 1000) > exp
+
+def check_limits():
+    """قطع کاربرانی که حجمشان تمام شده یا منقضی شدند"""
+    db     = load_db()
+    stats  = wg_stats()
+    active = wg_active_peers()
+    changed = False
+    now_ms  = int(time.time() * 1000)
+
+    for p in db["peers"]:
+        # بررسی انقضا
+        if is_expired(p) and not p.get("expBlocked"):
+            if p["pubkey"] in active:
+                wg_remove_peer(p["pubkey"])
+            p["expBlocked"] = True
+            changed = True
+
+        # بررسی حجم
+        max_b = p.get("maxBytes", 0)
+        if max_b > 0:
+            used = stats.get(p["pubkey"], 0)
+            if used >= max_b and not p.get("volBlocked"):
+                if p["pubkey"] in active:
+                    wg_remove_peer(p["pubkey"])
+                p["volBlocked"] = True
+                changed = True
+
+    if changed: save_db(db)
+
+def bg_checker():
+    """بررسی هر ۶۰ ثانیه"""
+    while True:
+        try: check_limits()
+        except: pass
+        time.sleep(60)
+
+# ── Routes ──────────────────────────────────────────
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    d = request.json or {}
+    if d.get("password") == load_cfg()["admin_pass"]:
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "رمز اشتباه"}), 401
+
+@app.route("/api/change-password", methods=["POST"])
+def change_password():
+    d   = request.json or {}
+    cfg = load_cfg()
+    if d.get("current") != cfg["admin_pass"]:
+        return jsonify({"error": "رمز فعلی اشتباه است"}), 401
+    nw = d.get("new","").strip()
+    if len(nw) < 4:
+        return jsonify({"error": "حداقل ۴ کاراکتر"}), 400
+    cfg["admin_pass"] = nw
+    save_cfg(cfg)
+    return jsonify({"ok": True})
+
+@app.route("/api/server", methods=["GET"])
+def server_info():
+    pub = open("/etc/wireguard/server_public.key").read().strip()
+    return jsonify({"pubkey": pub, "ip": os.environ.get("SERVER_IP",""), "port": 51820})
+
+@app.route("/api/peers", methods=["GET"])
+def get_peers():
+    check_limits()
+    db     = load_db()
+    stats  = wg_stats()
+    hs     = wg_handshakes()
+    active = wg_active_peers()
+    now    = int(time.time())
+    out    = []
+    for p in db["peers"]:
+        pk    = p["pubkey"]
+        used  = stats.get(pk, 0)
+        last  = hs.get(pk, 0)
+        is_on = pk in active and (now - last) < 180 if last > 0 else pk in active
+        exp   = is_expired(p)
+        out.append({**p, "usedBytes": used, "active": is_on, "lastSeen": last*1000, "expired": exp})
+    return jsonify(out)
+
+@app.route("/api/peers", methods=["POST"])
+def add_peer():
+    d         = request.json or {}
+    name      = d.get("name","").strip()
+    max_gb    = float(d.get("maxGB", 0))
+    speed_k   = int(d.get("speedKbps", 0))
+    expires_at = int(d.get("expiresAt", 0))   # timestamp ms, 0=بدون انقضا
+
+    if not name: return jsonify({"error": "نام الزامی است"}), 400
+    ip = next_ip()
+    if not ip: return jsonify({"error": "ظرفیت IP تمام شده"}), 500
+
+    priv, pub = gen_keypair()
+    peer = {
+        "id":        f"p{int(time.time()*1000)}",
+        "name":      name,
+        "ip":        ip,
+        "privkey":   priv,
+        "pubkey":    pub,
+        "maxBytes":  int(max_gb * 1024**3) if max_gb > 0 else 0,
+        "speedKbps": speed_k,
+        "expiresAt": expires_at,
+        "volBlocked": False,
+        "expBlocked": False,
+        "createdAt": int(time.time()*1000),
+    }
+    db = load_db()
+    db["peers"].append(peer)
+    save_db(db)
+
+    if not is_expired(peer):
+        wg_add_peer(pub, ip)
+        if speed_k > 0: tc_apply(ip, speed_k)
+
+    return jsonify(peer), 201
+
+@app.route("/api/peers/<pid>", methods=["PUT"])
+def update_peer(pid):
+    db   = load_db()
+    data = request.json or {}
+    for p in db["peers"]:
+        if p["id"] == pid:
+            if "name"      in data: p["name"]      = data["name"].strip()
+            if "maxGB"     in data:
+                mg = float(data["maxGB"])
+                p["maxBytes"] = int(mg * 1024**3) if mg > 0 else 0
+                if p.get("volBlocked") and p["maxBytes"] == 0:
+                    p["volBlocked"] = False
+                    if not is_expired(p): wg_add_peer(p["pubkey"], p["ip"])
+            if "speedKbps" in data:
+                p["speedKbps"] = int(data["speedKbps"])
+                if p["speedKbps"] > 0: tc_apply(p["ip"], p["speedKbps"])
+                else: tc_remove(p["ip"])
+            if "expiresAt" in data:
+                p["expiresAt"] = int(data["expiresAt"])
+                # اگه تاریخ تمدید شد و قبلاً expBlocked بود، وصل کن
+                if p.get("expBlocked") and not is_expired(p):
+                    p["expBlocked"] = False
+                    if not p.get("volBlocked"): wg_add_peer(p["pubkey"], p["ip"])
+                # اگه تاریخ جدید منقضی شد
+                if is_expired(p) and not p.get("expBlocked"):
+                    wg_remove_peer(p["pubkey"])
+                    p["expBlocked"] = True
+            save_db(db)
+            return jsonify({**p, "expired": is_expired(p)})
+    return jsonify({"error": "یافت نشد"}), 404
+
+@app.route("/api/peers/<pid>", methods=["DELETE"])
+def delete_peer(pid):
+    db = load_db()
+    p  = next((x for x in db["peers"] if x["id"] == pid), None)
+    if not p: return jsonify({"error": "یافت نشد"}), 404
+    wg_remove_peer(p["pubkey"])
+    tc_remove(p["ip"])
+    db["peers"] = [x for x in db["peers"] if x["id"] != pid]
+    save_db(db)
+    return jsonify({"ok": True})
+
+@app.route("/api/peers/<pid>/toggle", methods=["POST"])
+def toggle_peer(pid):
+    db     = load_db()
+    active = wg_active_peers()
+    p      = next((x for x in db["peers"] if x["id"] == pid), None)
+    if not p: return jsonify({"error": "یافت نشد"}), 404
+    if p["pubkey"] in active:
+        wg_remove_peer(p["pubkey"]); tc_remove(p["ip"])
+        p["volBlocked"] = True
+    else:
+        if not is_expired(p):
+            wg_add_peer(p["pubkey"], p["ip"])
+            if p.get("speedKbps",0) > 0: tc_apply(p["ip"], p["speedKbps"])
+        p["volBlocked"] = False
+    save_db(db)
+    return jsonify({"ok": True})
+
+@app.route("/api/peers/<pid>/reset", methods=["POST"])
+def reset_usage(pid):
+    db = load_db()
+    p  = next((x for x in db["peers"] if x["id"] == pid), None)
+    if not p: return jsonify({"error": "یافت نشد"}), 404
+    wg_remove_peer(p["pubkey"])
+    time.sleep(0.5)
+    if not is_expired(p):
+        wg_add_peer(p["pubkey"], p["ip"])
+        if p.get("speedKbps",0) > 0: tc_apply(p["ip"], p["speedKbps"])
+    p["volBlocked"] = False
+    save_db(db)
+    return jsonify({"ok": True})
+
+if __name__ == "__main__":
+    t = threading.Thread(target=bg_checker, daemon=True)
+    t.start()
+    app.run(host="127.0.0.1", port=5000, debug=False)
+PYEOF
+
+chmod +x /opt/wg-api/app.py
+ok "API ساخته شد"
+
+cat > /etc/systemd/system/wg-api.service << SVCEOF
+[Unit]
+Description=WireGuard Panel API
+After=network.target wg-quick@wg0.service
+
+[Service]
+ExecStart=/opt/wg-venv/bin/python3 /opt/wg-api/app.py
+Restart=always
+RestartSec=5
+Environment="SERVER_IP=${SERVER_IP}"
+WorkingDirectory=/opt/wg-api
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+systemctl daemon-reload
+systemctl enable wg-api > /dev/null 2>&1
+systemctl restart wg-api
+sleep 3
+systemctl is-active --quiet wg-api && ok "API فعال (port 5000)" || { warn "API مشکل دارد:"; journalctl -u wg-api -n 10 --no-pager; }
+
+info "آماده‌سازی React..."
+mkdir -p /opt/wg-panel && cd /opt/wg-panel
+if [[ ! -f package.json ]]; then
+  npx --yes create-react-app . --template cra-template 2>&1 | tail -5
+fi
+npm install --save recharts qrcode.react 2>&1 | tail -3
+ok "npm packages آماده"
+rm -f src/App.js src/App.css src/App.test.js src/logo.svg src/reportWebVitals.js src/setupTests.js
+
+cat > src/App.jsx << 'APPEOF'
+import { useState, useEffect, useCallback } from "react";
+import { AreaChart,Area,XAxis,YAxis,Tooltip,ResponsiveContainer,PieChart,Pie,Cell } from "recharts";
+import { QRCodeSVG } from "qrcode.react";
+
+const C={bg:"#0a0e1a",surface:"#111827",surfaceHover:"#1a2235",border:"#1e2d45",cyan:"#00d4ff",cyanDim:"#00d4ff22",green:"#00e676",orange:"#ff9100",red:"#ff1744",purple:"#7c3aed",text:"#e8edf5",textMuted:"#6b7fa3",textDim:"#3a4a6b"};
+const API=`${window.location.protocol}//${window.location.hostname}/api`;
+const PIE=[C.cyan,C.purple,C.green,C.orange,"#ec4899","#f43f5e","#06b6d4","#84cc16"];
+
+const fmt={
+  bytes:(b)=>{if(!b||b<=0)return"0 B";if(b>=1e12)return(b/1e12).toFixed(2)+" TB";if(b>=1e9)return(b/1e9).toFixed(2)+" GB";if(b>=1e6)return(b/1e6).toFixed(2)+" MB";return(b/1e3).toFixed(1)+" KB";},
+  pct:(u,m)=>m>0?Math.min(100,Math.round((u/m)*100)):0,
+  time:(ts)=>ts>0?new Date(ts).toLocaleTimeString("fa-IR"):"—",
+  vol:(b)=>b>0?fmt.bytes(b):"∞ بینهایت",
+  speed:(k)=>k>0?`${(k/1024).toFixed(1)} Mbps`:"∞ بینهایت",
+  date:(ms)=>{
+    if(!ms||ms<=0)return"بدون انقضا";
+    const d=new Date(ms);
+    return d.toLocaleDateString("fa-IR",{year:"numeric",month:"long",day:"numeric"});
+  },
+  daysLeft:(ms)=>{
+    if(!ms||ms<=0)return null;
+    const diff=ms-Date.now();
+    if(diff<=0)return"منقضی شده";
+    const days=Math.ceil(diff/86400000);
+    if(days===1)return"فردا منقضی میشه";
+    return `${days} روز مانده`;
+  },
+};
+
+function genHistory(){return Array.from({length:24},(_,i)=>({t:`${i}:00`,rx:Math.random()*800+100,tx:Math.random()*400+50}));}
+
+// ── Helpers ──────────────────────────────────────────
+function PulseRing({active,blocked,expired}){
+  const color=blocked||expired?C.red:active?C.green:C.textDim;
+  return(<span style={{position:"relative",display:"inline-block",width:12,height:12}}><span style={{display:"block",width:12,height:12,borderRadius:"50%",background:color,opacity:(blocked||expired)?1:active?1:0.3}}/>{active&&!blocked&&!expired&&<span style={{position:"absolute",inset:-4,borderRadius:"50%",border:`2px solid ${color}`,animation:"pulse 1.8s ease-out infinite"}}/>}</span>);
+}
+
+function UsageBar({used,max,compact}){
+  const inf=max<=0;const pct=inf?0:fmt.pct(used,max);
+  const color=pct>=100?C.red:pct>=85?C.orange:C.cyan;
+  return(<div><div style={{height:compact?4:6,background:C.border,borderRadius:99,overflow:"hidden"}}><div style={{width:inf?"100%":`${pct}%`,height:"100%",borderRadius:99,background:inf?`linear-gradient(90deg,${C.cyan}33,${C.cyan}11)`:`linear-gradient(90deg,${color}88,${color})`,transition:"width .6s"}}/></div>
+  {!compact&&<div style={{display:"flex",justifyContent:"space-between",marginTop:4}}><span style={{fontSize:11,color:C.textMuted}}>{fmt.bytes(used)}</span>{inf?<span style={{fontSize:11,color:C.textMuted}}>∞</span>:<span style={{fontSize:11,color,fontWeight:700}}>{pct}%</span>}<span style={{fontSize:11,color:C.textMuted}}>{fmt.vol(max)}</span></div>}</div>);
+}
+
+function Card({label,value,sub,color,icon}){
+  return(<div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:12,padding:"18px 22px",display:"flex",flexDirection:"column",gap:6}}><div style={{fontSize:11,color:C.textMuted,letterSpacing:"0.08em",textTransform:"uppercase"}}>{icon} {label}</div><div style={{fontSize:28,fontWeight:800,color:color||C.text,fontFamily:"monospace",letterSpacing:"-1px"}}>{value}</div>{sub&&<div style={{fontSize:12,color:C.textMuted}}>{sub}</div>}</div>);
+}
+
+function Btn({onClick,color,title,children,disabled}){
+  return(<button onClick={onClick} title={title} disabled={disabled} style={{width:32,height:32,borderRadius:8,border:`1px solid ${color}33`,background:color+"18",color,cursor:disabled?"not-allowed":"pointer",fontSize:14,display:"flex",alignItems:"center",justifyContent:"center",opacity:disabled?0.4:1}}>{children}</button>);
+}
+
+function Field({label,children}){return(<label style={{display:"block"}}><div style={{fontSize:12,color:C.textMuted,marginBottom:6}}>{label}</div>{children}</label>);}
+
+function ModalWrap({onClose,children,width=420}){
+  return(<div style={{position:"fixed",inset:0,background:"#000c",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={onClose}><div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:18,padding:28,width,maxHeight:"92vh",overflowY:"auto",boxShadow:`0 0 80px ${C.cyanDim}`}} onClick={e=>e.stopPropagation()}>{children}</div></div>);
+}
+
+// ── Limit Fields (حجم + سرعت + تاریخ انقضا) ─────────
+const QUICK_PRESETS=[
+  {label:"۷ روز",  days:7},
+  {label:"۱ ماه",  days:30},
+  {label:"۳ ماه",  days:90},
+  {label:"۶ ماه",  days:180},
+  {label:"۱ سال",  days:365},
+];
+
+function LimitFields({maxGB,setMaxGB,speedKbps,setSpeedKbps,expiresAt,setExpiresAt}){
+  const [volMode,setVolMode]=useState(maxGB>0?"custom":"inf");
+  const [spMode,setSpMode]=useState(speedKbps>0?"custom":"inf");
+  const [expMode,setExpMode]=useState(expiresAt>0?"custom":"inf");
+  const [volVal,setVolVal]=useState(maxGB>0?maxGB:50);
+  const [spVal,setSpVal]=useState(speedKbps>0?speedKbps:10240);
+
+  // واحد: روز یا ماه
+  const [expUnit,setExpUnit]=useState("day");   // "day" | "month"
+  const [expNum,setExpNum]=useState(30);
+
+  // محاسبه timestamp از روز/ماه
+  const calcExpiry=(num,unit)=>{
+    const d=new Date();
+    if(unit==="day") d.setDate(d.getDate()+num);
+    else d.setMonth(d.getMonth()+num);
+    d.setHours(23,59,59,0);
+    return d.getTime();
+  };
+
+  // اگه expiresAt از بیرون داده شده (حالت ویرایش)، نمایشش کن
+  const [editTs,setEditTs]=useState(expiresAt>0?expiresAt:0);
+
+  useEffect(()=>{setMaxGB(volMode==="inf"?0:volVal);},[volMode,volVal]);
+  useEffect(()=>{setSpeedKbps(spMode==="inf"?0:spVal);},[spMode,spVal]);
+  useEffect(()=>{
+    if(expMode==="inf"){setExpiresAt(0);setEditTs(0);}
+    else{
+      const ts=calcExpiry(expNum,expUnit);
+      setExpiresAt(ts);setEditTs(ts);
+    }
+  },[expMode,expNum,expUnit]);
+
+  const toggleBtn=(cur,setVal)=>["inf","custom"].map(m=>(
+    <button key={m} type="button" onClick={()=>setVal(m)} style={{flex:1,padding:"7px 0",borderRadius:7,border:`1px solid ${cur===m?C.cyan:C.border}`,background:cur===m?C.cyan+"22":"transparent",color:cur===m?C.cyan:C.textMuted,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+      {m==="inf"?"∞ بینهایت":"محدود"}
+    </button>
+  ));
+
+  const applyPreset=(days)=>{
+    if(days>=30&&days%30===0){setExpUnit("month");setExpNum(days/30);}
+    else{setExpUnit("day");setExpNum(days);}
+  };
+
+  const inputStyle={background:C.bg,border:`1px solid ${C.border}`,color:C.text,borderRadius:8,padding:"10px 14px",fontSize:15,outline:"none",boxSizing:"border-box",fontFamily:"monospace"};
+  const daysLeft=editTs>0?fmt.daysLeft(editTs):null;
+
+  return(<>
+    <Field label="📦 حجم مجاز">
+      <div style={{display:"flex",gap:8,marginBottom:8}}>{toggleBtn(volMode,setVolMode)}</div>
+      {volMode==="custom"&&<><input type="number" min={1} value={volVal} onChange={e=>setVolVal(+e.target.value)} placeholder="مثلاً 50" style={{...inputStyle,width:"100%"}}/><div style={{fontSize:11,color:C.textMuted,marginTop:4}}>{fmt.bytes(volVal*1024**3)}</div></>}
+      {volMode==="inf"&&<div style={{fontSize:11,color:C.textMuted}}>بدون محدودیت حجم</div>}
+    </Field>
+
+    <Field label="⚡ سرعت مجاز">
+      <div style={{display:"flex",gap:8,marginBottom:8}}>{toggleBtn(spMode,setSpMode)}</div>
+      {spMode==="custom"&&<><input type="number" min={0.1} step={0.1} value={Math.round(spVal/1024*10)/10} onChange={e=>setSpVal(Math.round(+e.target.value*1024))} placeholder="مثلاً 10" style={{...inputStyle,width:"100%"}}/><div style={{fontSize:11,color:C.textMuted,marginTop:4}}>{spVal.toLocaleString()} kbps</div></>}
+      {spMode==="inf"&&<div style={{fontSize:11,color:C.textMuted}}>بدون محدودیت سرعت</div>}
+    </Field>
+
+    <Field label="📅 تاریخ انقضا">
+      <div style={{display:"flex",gap:8,marginBottom:10}}>{toggleBtn(expMode,setExpMode)}</div>
+      {expMode==="custom"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {/* دکمه‌های سریع */}
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            {QUICK_PRESETS.map(({label,days})=>(
+              <button key={days} type="button" onClick={()=>applyPreset(days)} style={{padding:"5px 12px",borderRadius:7,border:`1px solid ${C.border}`,background:C.bg,color:C.textMuted,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+                {label}
+              </button>
+            ))}
+          </div>
+          {/* ورود دستی عدد + واحد */}
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <input type="number" min={1} max={expUnit==="day"?3650:120} value={expNum}
+              onChange={e=>setExpNum(Math.max(1,+e.target.value))}
+              style={{...inputStyle,width:90,textAlign:"center"}}/>
+            <div style={{display:"flex",gap:4}}>
+              {[["day","روز"],["month","ماه"]].map(([u,l])=>(
+                <button key={u} type="button" onClick={()=>setExpUnit(u)} style={{padding:"8px 14px",borderRadius:7,border:`1px solid ${expUnit===u?C.cyan:C.border}`,background:expUnit===u?C.cyan+"22":"transparent",color:expUnit===u?C.cyan:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit",fontWeight:expUnit===u?700:400}}>
+                  {l}
+                </button>
+              ))}
+            </div>
+          </div>
+          {/* نمایش تاریخ محاسبه‌شده */}
+          {editTs>0&&(
+            <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"8px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{fontSize:12,color:C.textMuted}}>📅 انقضا در:</span>
+              <span style={{fontSize:13,color:C.cyan,fontFamily:"monospace",fontWeight:700}}>{fmt.date(editTs)}</span>
+              <span style={{fontSize:11,color:C.orange}}>({daysLeft})</span>
+            </div>
+          )}
+        </div>
+      )}
+      {expMode==="inf"&&<div style={{fontSize:11,color:C.textMuted}}>بدون تاریخ انقضا</div>}
+    </Field>
+  </>);
+}
+
+// ── Login ─────────────────────────────────────────────
+function LoginPage({onLogin}){
+  const [pass,setPass]=useState("");const [err,setErr]=useState("");const [loading,setLoading]=useState(false);
+  const submit=async()=>{
+    if(!pass.trim())return;setLoading(true);setErr("");
+    try{const r=await fetch(`${API}/login`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pass})});
+    if(r.ok){onLogin();}else{setErr("رمز عبور اشتباه است");}}
+    catch{setErr("خطا در اتصال به سرور");}setLoading(false);
+  };
+  return(
+    <div style={{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:20,padding:44,width:340,boxShadow:`0 0 80px ${C.cyanDim}`}}>
+        <div style={{textAlign:"center",marginBottom:32}}><div style={{fontSize:40,marginBottom:12}}>🔒</div><div style={{fontSize:22,fontWeight:800,color:C.text}}>WireGuard Panel</div></div>
+        <Field label="رمز عبور مدیریت">
+          <input type="password" value={pass} onChange={e=>setPass(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} placeholder="رمز عبور" autoFocus
+            style={{width:"100%",background:C.bg,border:`1px solid ${err?C.red:C.border}`,color:C.text,borderRadius:10,padding:"12px 16px",fontSize:15,outline:"none",boxSizing:"border-box"}}/>
+          {err&&<div style={{fontSize:12,color:C.red,marginTop:6}}>{err}</div>}
+        </Field>
+        <button onClick={submit} disabled={loading} style={{width:"100%",padding:"13px 0",borderRadius:10,border:"none",background:`linear-gradient(135deg,${C.cyan},${C.purple})`,color:C.bg,cursor:"pointer",fontSize:15,fontWeight:800,fontFamily:"inherit",marginTop:16,opacity:loading?0.7:1}}>
+          {loading?"در حال ورود...":"ورود به پنل"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Change Password ───────────────────────────────────
+function ChangePassModal({onClose,showToast}){
+  const [cur,setCur]=useState("");const [nw,setNw]=useState("");const [nw2,setNw2]=useState("");const [err,setErr]=useState("");const [loading,setLoading]=useState(false);
+  const submit=async()=>{
+    if(nw!==nw2){setErr("رمزهای جدید یکسان نیستند");return;}
+    if(nw.length<4){setErr("حداقل ۴ کاراکتر");return;}
+    setLoading(true);setErr("");
+    try{const r=await fetch(`${API}/change-password`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({current:cur,new:nw})});
+    const d=await r.json();if(r.ok){showToast("رمز تغییر کرد ✓");onClose();}else{setErr(d.error||"خطا");}}
+    catch{setErr("خطا در اتصال");}setLoading(false);
+  };
+  const inp={width:"100%",background:C.bg,border:`1px solid ${C.border}`,color:C.text,borderRadius:8,padding:"10px 14px",fontSize:14,outline:"none",boxSizing:"border-box"};
+  return(<ModalWrap onClose={onClose} width={360}>
+    <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:24}}>🔑 تغییر رمز عبور</div>
+    <div style={{display:"flex",flexDirection:"column",gap:14}}>
+      <Field label="رمز فعلی"><input type="password" value={cur} onChange={e=>setCur(e.target.value)} style={inp}/></Field>
+      <Field label="رمز جدید"><input type="password" value={nw} onChange={e=>setNw(e.target.value)} style={inp}/></Field>
+      <Field label="تکرار رمز جدید"><input type="password" value={nw2} onChange={e=>setNw2(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} style={{...inp,border:`1px solid ${err?C.red:C.border}`}}/></Field>
+      {err&&<div style={{fontSize:12,color:C.red}}>{err}</div>}
+    </div>
+    <div style={{display:"flex",gap:10,marginTop:20}}>
+      <button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>انصراف</button>
+      <button onClick={submit} disabled={loading} style={{flex:2,padding:"11px 0",borderRadius:8,border:"none",background:C.cyan,color:C.bg,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>ذخیره</button>
+    </div>
+  </ModalWrap>);
+}
+
+// ── Add User ──────────────────────────────────────────
+function AddUserModal({onClose,onAdd}){
+  const [name,setName]=useState("");const [maxGB,setMaxGB]=useState(0);const [speed,setSpeed]=useState(0);const [expiresAt,setExpiresAt]=useState(0);const [loading,setLoading]=useState(false);const [err,setErr]=useState("");
+  const submit=async()=>{
+    if(!name.trim()){setErr("نام الزامی است");return;}setLoading(true);setErr("");
+    try{const r=await fetch(`${API}/peers`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name.trim(),maxGB,speedKbps:speed,expiresAt})});
+    const d=await r.json();if(r.ok){onAdd(d);onClose();}else{setErr(d.error||"خطا");}}
+    catch{setErr("خطا در اتصال");}setLoading(false);
+  };
+  return(<ModalWrap onClose={onClose} width={440}>
+    <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:24}}>➕ افزودن کاربر جدید</div>
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      <Field label="نام کاربر">
+        <input value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} placeholder="مثلاً: علی رضایی" autoFocus
+          style={{width:"100%",background:C.bg,border:`1px solid ${err?C.red:C.border}`,color:C.text,borderRadius:8,padding:"10px 14px",fontSize:14,outline:"none",boxSizing:"border-box"}}/>
+        {err&&<div style={{fontSize:11,color:C.red,marginTop:4}}>{err}</div>}
+      </Field>
+      <LimitFields maxGB={maxGB} setMaxGB={setMaxGB} speedKbps={speed} setSpeedKbps={setSpeed} expiresAt={expiresAt} setExpiresAt={setExpiresAt}/>
+    </div>
+    <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 14px",marginTop:12,fontSize:11,color:C.textMuted}}>🔑 IP و کلیدها خودکار توسط سرور ساخته می‌شوند</div>
+    <div style={{display:"flex",gap:10,marginTop:20}}>
+      <button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>انصراف</button>
+      <button onClick={submit} disabled={loading} style={{flex:2,padding:"11px 0",borderRadius:8,border:"none",background:C.cyan,color:C.bg,cursor:loading?"not-allowed":"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit",opacity:loading?0.7:1}}>
+        {loading?"در حال ساخت...":"➕ افزودن"}
+      </button>
+    </div>
+  </ModalWrap>);
+}
+
+// ── Config Modal ──────────────────────────────────────
+function ConfigModal({peer,serverInfo,onClose}){
+  const [tab,setTab]=useState("qr");
+  const cfg=`[Interface]\nPrivateKey = ${peer.privkey}\nAddress = ${peer.ip}/24\nDNS = 1.1.1.1, 8.8.8.8\n\n[Peer]\nPublicKey = ${serverInfo?.pubkey||""}\nEndpoint = ${serverInfo?.ip||""}:${serverInfo?.port||51820}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25`;
+  const dl=()=>{const b=new Blob([cfg],{type:"text/plain"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download=`${peer.name.replace(/\s+/g,"-")}-wg.conf`;a.click();URL.revokeObjectURL(u);};
+  return(<ModalWrap onClose={onClose}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+      <div><div style={{fontSize:12,color:C.textMuted}}>کانفیگ اتصال</div><div style={{fontSize:18,fontWeight:700,color:C.text}}>{peer.name}</div></div>
+      <button onClick={onClose} style={{background:"transparent",border:`1px solid ${C.border}`,color:C.textMuted,borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:16}}>✕</button>
+    </div>
+    <div style={{display:"flex",gap:4,background:C.bg,borderRadius:10,padding:4,marginBottom:20}}>
+      {[["qr","📷 QR Code"],["conf","📄 کانفیگ"]].map(([k,l])=>(<button key={k} onClick={()=>setTab(k)} style={{flex:1,padding:"8px 0",borderRadius:7,border:"none",cursor:"pointer",fontSize:13,fontFamily:"inherit",background:tab===k?C.cyan:"transparent",color:tab===k?C.bg:C.textMuted,fontWeight:tab===k?700:400}}>{l}</button>))}
+    </div>
+    {tab==="qr"&&(
+      <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:16}}>
+        <div style={{background:"#fff",padding:16,borderRadius:14}}><QRCodeSVG value={cfg} size={210} bgColor="#ffffff" fgColor="#000000" level="M"/></div>
+        <div style={{fontSize:12,color:C.textMuted,textAlign:"center"}}>با اپ WireGuard یا Netmod اسکن کنید</div>
+        {peer.expiresAt>0&&<div style={{background:C.orange+"22",border:`1px solid ${C.orange}44`,borderRadius:8,padding:"8px 14px",fontSize:11,color:C.orange,textAlign:"center",width:"100%"}}>⏰ انقضا: {fmt.date(peer.expiresAt)}</div>}
+      </div>
+    )}
+    {tab==="conf"&&(
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        <pre style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:16,fontSize:11,fontFamily:"monospace",color:"#a0c4ff",lineHeight:1.8,overflowX:"auto",margin:0,whiteSpace:"pre-wrap",wordBreak:"break-all"}}>{cfg}</pre>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>navigator.clipboard.writeText(cfg).catch(()=>{})} style={{flex:1,padding:"10px 0",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>📋 کپی</button>
+          <button onClick={dl} style={{flex:2,padding:"10px 0",borderRadius:8,border:"none",background:C.cyan,color:C.bg,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>⬇ دانلود .conf</button>
+        </div>
+      </div>
+    )}
+  </ModalWrap>);
+}
+
+// ── Edit Modal ────────────────────────────────────────
+function EditModal({peer,onClose,onSave}){
+  const [name,setName]=useState(peer.name);
+  const [maxGB,setMaxGB]=useState(peer.maxBytes>0?peer.maxBytes/1024**3:0);
+  const [speed,setSpeed]=useState(peer.speedKbps||0);
+  const [expiresAt,setExpiresAt]=useState(peer.expiresAt||0);
+  const [loading,setLoading]=useState(false);
+  const submit=async()=>{
+    setLoading(true);
+    try{const r=await fetch(`${API}/peers/${peer.id}`,{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,maxGB,speedKbps:speed,expiresAt})});
+    const d=await r.json();if(r.ok){onSave(d);onClose();}}catch{}setLoading(false);
+  };
+  return(<ModalWrap onClose={onClose} width={440}>
+    <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:24}}>✏️ ویرایش {peer.name}</div>
+    <div style={{display:"flex",flexDirection:"column",gap:16}}>
+      <Field label="نام کاربر"><input value={name} onChange={e=>setName(e.target.value)} style={{width:"100%",background:C.bg,border:`1px solid ${C.border}`,color:C.text,borderRadius:8,padding:"10px 14px",fontSize:14,outline:"none",boxSizing:"border-box"}}/></Field>
+      <LimitFields maxGB={maxGB} setMaxGB={setMaxGB} speedKbps={speed} setSpeedKbps={setSpeed} expiresAt={expiresAt} setExpiresAt={setExpiresAt}/>
+    </div>
+    <div style={{display:"flex",gap:10,marginTop:20}}>
+      <button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>انصراف</button>
+      <button onClick={submit} disabled={loading} style={{flex:2,padding:"11px 0",borderRadius:8,border:"none",background:C.cyan,color:C.bg,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>ذخیره تغییرات</button>
+    </div>
+  </ModalWrap>);
+}
+
+// ── Main ──────────────────────────────────────────────
+export default function App(){
+  const [loggedIn,setLoggedIn]=useState(false);
+  const [peers,setPeers]=useState([]);
+  const [serverInfo,setServerInfo]=useState(null);
+  const [history]=useState(genHistory());
+  const [selected,setSelected]=useState(null);
+  const [editing,setEditing]=useState(null);
+  const [configPeer,setConfigPeer]=useState(null);
+  const [addingUser,setAddingUser]=useState(false);
+  const [changingPass,setChangingPass]=useState(false);
+  const [confirmDel,setConfirmDel]=useState(null);
+  const [toast,setToast]=useState(null);
+  const [tab,setTab]=useState("peers");
+  const [loading,setLoading]=useState(false);
+
+  const showToast=(msg,color=C.green)=>{setToast({msg,color});setTimeout(()=>setToast(null),3500);};
+  const fetchPeers=useCallback(async()=>{try{const r=await fetch(`${API}/peers`);if(r.ok)setPeers(await r.json());}catch{}},[] );
+
+  useEffect(()=>{
+    if(!loggedIn)return;
+    setLoading(true);
+    Promise.all([
+      fetch(`${API}/peers`).then(r=>r.json()).then(setPeers).catch(()=>{}),
+      fetch(`${API}/server`).then(r=>r.json()).then(setServerInfo).catch(()=>{}),
+    ]).finally(()=>setLoading(false));
+    const t=setInterval(fetchPeers,10000);
+    return()=>clearInterval(t);
+  },[loggedIn,fetchPeers]);
+
+  const deletePeer=async(id)=>{try{await fetch(`${API}/peers/${id}`,{method:"DELETE"});setPeers(p=>p.filter(x=>x.id!==id));setConfirmDel(null);showToast("کاربر حذف شد",C.red);}catch{showToast("خطا",C.red);}};
+  const togglePeer=async(id)=>{const p=peers.find(x=>x.id===id);try{await fetch(`${API}/peers/${id}/toggle`,{method:"POST"});fetchPeers();showToast(p?.active?`${p.name} قطع شد`:`${p.name} وصل شد`,p?.active?C.orange:C.green);}catch{showToast("خطا",C.red);}};
+  const resetPeer=async(id)=>{try{await fetch(`${API}/peers/${id}/reset`,{method:"POST"});fetchPeers();showToast("مصرف ریست شد");}catch{showToast("خطا",C.red);}};
+
+  const activePeers=peers.filter(p=>p.active).length;
+  const expiredPeers=peers.filter(p=>p.expired).length;
+  const totalUsed=peers.reduce((s,p)=>s+(p.usedBytes||0),0);
+  const totalMax=peers.reduce((s,p)=>s+(p.maxBytes||0),0);
+  const pieData=peers.map(p=>({name:p.name,value:p.usedBytes||1}));
+
+  if(!loggedIn)return <LoginPage onLogin={()=>setLoggedIn(true)}/>;
+
+  return(
+    <div dir="rtl" style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'Vazirmatn','Segoe UI',sans-serif",paddingBottom:40}}>
+      <style>{`@keyframes pulse{0%{opacity:.8;transform:scale(1)}100%{opacity:0;transform:scale(2.4)}}*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:${C.bg}}::-webkit-scrollbar-thumb{background:${C.border};border-radius:3px}button:hover{opacity:.85}input[type=date]::-webkit-calendar-picker-indicator{filter:invert(1)}`}</style>
+
+      {/* Header */}
+      <div style={{borderBottom:`1px solid ${C.border}`,padding:"16px 32px",display:"flex",alignItems:"center",justifyContent:"space-between",background:`${C.surface}dd`,backdropFilter:"blur(10px)",position:"sticky",top:0,zIndex:50}}>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{width:36,height:36,borderRadius:10,background:`linear-gradient(135deg,${C.cyan},${C.purple})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>🔒</div>
+          <div><div style={{fontWeight:800,fontSize:16}}>WireGuard Panel</div><div style={{fontSize:11,color:C.textMuted,fontFamily:"monospace"}}>{serverInfo?.ip}:{serverInfo?.port||51820}</div></div>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <button onClick={()=>setAddingUser(true)} style={{padding:"8px 16px",borderRadius:8,border:"none",background:`linear-gradient(135deg,${C.cyan},${C.purple})`,color:C.bg,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>➕ کاربر جدید</button>
+          <button onClick={()=>setChangingPass(true)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>🔑 رمز</button>
+          <button onClick={()=>setLoggedIn(false)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>خروج</button>
+        </div>
+      </div>
+
+      <div style={{maxWidth:1100,margin:"0 auto",padding:"28px 24px"}}>
+        {/* Stats */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:28}}>
+          <Card label="آنلاین" value={`${activePeers}/${peers.length}`} sub="کاربر فعال" color={C.cyan} icon="👥"/>
+          <Card label="مصرف کل" value={fmt.bytes(totalUsed)} sub={totalMax>0?`از ${fmt.bytes(totalMax)}`:"بدون محدودیت"} color={C.text} icon="📊"/>
+          <Card label="منقضی شده" value={expiredPeers} sub="نیاز به تمدید" color={expiredPeers>0?C.red:C.textMuted} icon="⏰"/>
+          <Card label="مجموع کاربران" value={peers.length} sub="ثبت‌شده" color={C.orange} icon="👤"/>
+        </div>
+
+        {/* Tabs */}
+        <div style={{display:"flex",gap:4,marginBottom:20,background:C.surface,borderRadius:10,padding:4,width:"fit-content"}}>
+          {[["peers","👤 کاربران"],["traffic","📈 ترافیک"]].map(([k,l])=>(
+            <button key={k} onClick={()=>setTab(k)} style={{padding:"7px 20px",borderRadius:7,border:"none",cursor:"pointer",fontSize:13,fontFamily:"inherit",background:tab===k?C.cyan:"transparent",color:tab===k?C.bg:C.textMuted,fontWeight:tab===k?700:400,transition:"all .2s"}}>{l}</button>
+          ))}
+        </div>
+
+        {tab==="peers"&&(
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {loading&&peers.length===0&&<div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,padding:48,textAlign:"center",color:C.textMuted}}>⏳ بارگذاری...</div>}
+            {!loading&&peers.length===0&&(
+              <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,padding:48,textAlign:"center",color:C.textMuted}}>
+                <div style={{fontSize:40,marginBottom:12}}>👤</div><div style={{marginBottom:16}}>هیچ کاربری وجود ندارد</div>
+                <button onClick={()=>setAddingUser(true)} style={{padding:"10px 24px",borderRadius:8,border:"none",background:C.cyan,color:C.bg,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>➕ افزودن اولین کاربر</button>
+              </div>
+            )}
+            {peers.map(p=>{
+              const isBlocked=!p.active&&p.maxBytes>0&&(p.usedBytes||0)>=p.maxBytes;
+              const isExpired=p.expired;
+              const daysLeft=fmt.daysLeft(p.expiresAt);
+              const nearExp=p.expiresAt>0&&!isExpired&&Date.now()>p.expiresAt-7*86400000;
+              const statusColor=isExpired?C.red:isBlocked?C.red:p.active?C.green:C.textMuted;
+              const isSel=selected===p.id;
+              return(
+                <div key={p.id} style={{background:isSel?C.surfaceHover:C.surface,border:`1px solid ${isSel?C.cyan+"55":isExpired?C.red+"44":C.border}`,borderRadius:14,overflow:"hidden",transition:"all .2s"}}>
+                  <div onClick={()=>setSelected(isSel?null:p.id)} style={{padding:"14px 20px",cursor:"pointer",display:"grid",alignItems:"center",gridTemplateColumns:"26px 1fr 90px 150px 130px 90px 180px",gap:10}}>
+                    <PulseRing active={p.active} blocked={isBlocked} expired={isExpired}/>
+                    <div>
+                      <div style={{fontWeight:700,fontSize:14}}>{p.name}</div>
+                      <div style={{fontSize:11,color:C.textMuted,fontFamily:"monospace",marginTop:2}}>{p.ip}</div>
+                    </div>
+                    <div style={{textAlign:"center"}}>
+                      <div style={{fontSize:10,color:C.textMuted,marginBottom:2}}>مصرف</div>
+                      <div style={{fontSize:12,fontFamily:"monospace",color:C.cyan}}>{fmt.bytes(p.usedBytes||0)}</div>
+                    </div>
+                    <div>
+                      <UsageBar used={p.usedBytes||0} max={p.maxBytes||0} compact/>
+                      <div style={{fontSize:10,color:C.textMuted,marginTop:3,textAlign:"center"}}>{fmt.vol(p.maxBytes||0)}</div>
+                    </div>
+                    {/* تاریخ انقضا */}
+                    <div style={{textAlign:"center"}}>
+                      {p.expiresAt>0?(
+                        <div>
+                          <div style={{fontSize:10,color:isExpired?C.red:nearExp?C.orange:C.textMuted,marginBottom:2}}>📅 انقضا</div>
+                          <div style={{fontSize:11,color:isExpired?C.red:nearExp?C.orange:C.textMuted,fontWeight:isExpired||nearExp?700:400}}>{daysLeft||fmt.date(p.expiresAt)}</div>
+                        </div>
+                      ):(
+                        <div style={{fontSize:11,color:C.textDim}}>∞ بدون انقضا</div>
+                      )}
+                    </div>
+                    <div style={{textAlign:"center"}}>
+                      <span style={{display:"inline-block",padding:"3px 8px",borderRadius:99,fontSize:11,fontWeight:700,background:statusColor+"22",color:statusColor}}>
+                        {isExpired?"منقضی":isBlocked?"مسدود":p.active?"آنلاین":"آفلاین"}
+                      </span>
+                    </div>
+                    <div style={{display:"flex",gap:4,justifyContent:"flex-end"}}>
+                      <Btn onClick={e=>{e.stopPropagation();setConfigPeer(p);}} color={C.cyan} title="QR / کانفیگ">📱</Btn>
+                      <Btn onClick={e=>{e.stopPropagation();togglePeer(p.id);}} color={p.active?C.orange:C.green} title={p.active?"قطع":"وصل"}>{p.active?"⏸":"▶"}</Btn>
+                      <Btn onClick={e=>{e.stopPropagation();setEditing(p);}} color={C.textMuted} title="ویرایش">✏️</Btn>
+                      <Btn onClick={e=>{e.stopPropagation();resetPeer(p.id);}} color={C.textDim} title="ریست مصرف">↺</Btn>
+                      <Btn onClick={e=>{e.stopPropagation();setConfirmDel(p.id);}} color={C.red} title="حذف">🗑</Btn>
+                    </div>
+                  </div>
+                  {isSel&&(
+                    <div style={{borderTop:`1px solid ${C.border}`,padding:"12px 20px",display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:14,background:C.bg+"44"}}>
+                      <div><div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>آخرین اتصال</div><div style={{fontSize:12,fontFamily:"monospace",color:C.text}}>{fmt.time(p.lastSeen)}</div></div>
+                      <div><div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>حجم مجاز</div><div style={{fontSize:12,fontFamily:"monospace",color:C.text}}>{fmt.vol(p.maxBytes||0)}</div></div>
+                      <div><div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>سرعت مجاز</div><div style={{fontSize:12,fontFamily:"monospace",color:C.text}}>{fmt.speed(p.speedKbps||0)}</div></div>
+                      <div><div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>تاریخ انقضا</div><div style={{fontSize:12,color:isExpired?C.red:nearExp?C.orange:C.text}}>{fmt.date(p.expiresAt)}</div></div>
+                      <div><div style={{fontSize:10,color:C.textMuted,marginBottom:6}}>کانفیگ</div><button onClick={()=>setConfigPeer(p)} style={{padding:"5px 12px",borderRadius:8,border:`1px solid ${C.cyan}55`,background:C.cyan+"18",color:C.cyan,cursor:"pointer",fontSize:11,fontFamily:"inherit",fontWeight:600}}>📱 QR / دانلود</button></div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {tab==="traffic"&&(
+          <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:16}}>
+            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,padding:24}}>
+              <div style={{fontSize:13,color:C.textMuted,marginBottom:20}}>ترافیک ۲۴ ساعت گذشته (MB)</div>
+              <ResponsiveContainer width="100%" height={240}>
+                <AreaChart data={history}>
+                  <defs>
+                    <linearGradient id="rx" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.cyan} stopOpacity={0.3}/><stop offset="95%" stopColor={C.cyan} stopOpacity={0}/></linearGradient>
+                    <linearGradient id="tx" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.purple} stopOpacity={0.3}/><stop offset="95%" stopColor={C.purple} stopOpacity={0}/></linearGradient>
+                  </defs>
+                  <XAxis dataKey="t" tick={{fill:C.textDim,fontSize:10}} axisLine={false} tickLine={false}/>
+                  <YAxis tick={{fill:C.textDim,fontSize:10}} axisLine={false} tickLine={false}/>
+                  <Tooltip contentStyle={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,color:C.text}}/>
+                  <Area type="monotone" dataKey="rx" stroke={C.cyan} fill="url(#rx)" strokeWidth={2} name="دریافت"/>
+                  <Area type="monotone" dataKey="tx" stroke={C.purple} fill="url(#tx)" strokeWidth={2} name="ارسال"/>
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,padding:24}}>
+              <div style={{fontSize:13,color:C.textMuted,marginBottom:16}}>سهم مصرف</div>
+              <ResponsiveContainer width="100%" height={180}>
+                <PieChart><Pie data={pieData} dataKey="value" innerRadius={50} outerRadius={80} paddingAngle={3}>{pieData.map((_,i)=><Cell key={i} fill={PIE[i%PIE.length]}/>)}</Pie><Tooltip formatter={v=>fmt.bytes(v)} contentStyle={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,color:C.text}}/></PieChart>
+              </ResponsiveContainer>
+              <div style={{display:"flex",flexDirection:"column",gap:8,marginTop:8}}>
+                {peers.map((p,i)=>(<div key={p.id} style={{display:"flex",alignItems:"center",gap:8}}><div style={{width:8,height:8,borderRadius:"50%",background:PIE[i%PIE.length],flexShrink:0}}/><span style={{fontSize:12,color:C.textMuted,flex:1}}>{p.name}</span><span style={{fontSize:12,fontFamily:"monospace",color:C.text}}>{fmt.bytes(p.usedBytes||0)}</span></div>))}
+              </div>
+            </div>
+            <div style={{gridColumn:"1/-1",background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,padding:24}}>
+              <div style={{fontSize:13,color:C.textMuted,marginBottom:20}}>وضعیت حجم و انقضا</div>
+              <div style={{display:"flex",flexDirection:"column",gap:16}}>
+                {peers.map(p=>{
+                  const isExp=p.expired;const near=p.expiresAt>0&&!isExp&&Date.now()>p.expiresAt-7*86400000;
+                  return(<div key={p.id} style={{display:"grid",gridTemplateColumns:"130px 1fr 130px 140px",gap:14,alignItems:"center"}}>
+                    <div style={{fontSize:13,fontWeight:600}}>{p.name}</div>
+                    <UsageBar used={p.usedBytes||0} max={p.maxBytes||0}/>
+                    <div style={{fontSize:11,color:C.textMuted,fontFamily:"monospace"}}>{p.maxBytes>0?`${fmt.bytes(p.maxBytes-(p.usedBytes||0))} مانده`:"∞ بینهایت"}</div>
+                    <div style={{fontSize:11,color:isExp?C.red:near?C.orange:C.textMuted,fontWeight:isExp||near?700:400}}>📅 {fmt.date(p.expiresAt)}</div>
+                  </div>);
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Delete confirm */}
+      {confirmDel&&(
+        <div style={{position:"fixed",inset:0,background:"#000c",zIndex:400,display:"flex",alignItems:"center",justifyContent:"center"}}>
+          <div style={{background:C.surface,border:`1px solid ${C.red}55`,borderRadius:16,padding:32,width:300,textAlign:"center"}}>
+            <div style={{fontSize:36,marginBottom:12}}>🗑</div>
+            <div style={{fontSize:17,fontWeight:700,color:C.text,marginBottom:8}}>حذف کاربر؟</div>
+            <div style={{fontSize:13,color:C.textMuted,marginBottom:24}}>این عمل قابل بازگشت نیست</div>
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={()=>setConfirmDel(null)} style={{flex:1,padding:"11px 0",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>انصراف</button>
+              <button onClick={()=>deletePeer(confirmDel)} style={{flex:1,padding:"11px 0",borderRadius:8,border:"none",background:C.red,color:"#fff",cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>حذف</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {configPeer&&<ConfigModal peer={configPeer} serverInfo={serverInfo} onClose={()=>setConfigPeer(null)}/>}
+      {editing&&<EditModal peer={editing} onClose={()=>setEditing(null)} onSave={(d)=>{setPeers(p=>p.map(x=>x.id===d.id?{...x,...d}:x));showToast("تنظیمات ذخیره شد");}}/>}
+      {addingUser&&<AddUserModal onClose={()=>setAddingUser(false)} onAdd={(p)=>{setPeers(prev=>[...prev,{...p,usedBytes:0,active:false}]);showToast(`${p.name} اضافه شد`);}}/>}
+      {changingPass&&<ChangePassModal onClose={()=>setChangingPass(false)} showToast={showToast}/>}
+      {toast&&<div style={{position:"fixed",bottom:28,left:"50%",transform:"translateX(-50%)",background:toast.color,color:C.bg,padding:"10px 24px",borderRadius:99,fontWeight:700,fontSize:13,zIndex:500,boxShadow:"0 4px 20px #0006"}}>{toast.msg}</div>}
+    </div>
+  );
+}
+APPEOF
+
+ok "App.jsx نوشته شد"
+
+cat > src/index.js << 'EOF'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+EOF
+
+info "بیلد React..."
+CI=false npm run build 2>&1 | tail -5
+ok "بیلد موفق"
+
+info "تنظیم Nginx..."
+cp -r build/* /var/www/html/
+cat > /etc/nginx/sites-available/wg-panel << 'NGEOF'
+server {
+    listen 80;
+    server_name _;
+    root /var/www/html;
+    index index.html;
+    location /api/ {
+        proxy_pass         http://127.0.0.1:5000/api/;
+        proxy_http_version 1.1;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+        proxy_read_timeout 60s;
+    }
+    location / { try_files $uri $uri/ /index.html; }
+}
+NGEOF
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/wg-panel /etc/nginx/sites-enabled/
+nginx -t && systemctl restart nginx
+ok "Nginx آماده"
+
+ufw allow 22/tcp >/dev/null 2>&1; ufw allow 80/tcp >/dev/null 2>&1
+ufw allow 443/tcp >/dev/null 2>&1; ufw allow 51820/udp >/dev/null 2>&1
+ufw --force enable >/dev/null 2>&1
+ok "فایروال تنظیم شد"
+
+echo ""
+echo -e "${GREEN}══════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}  ✅  نصب با موفقیت انجام شد!${NC}"
+echo -e "${GREEN}══════════════════════════════════════════════════${NC}"
+echo -e "  🌐 پنل:       ${CYAN}http://${SERVER_IP}${NC}"
+echo -e "  🔑 رمز پنل:  ${CYAN}admin123${NC}  (از پنل قابل تغییر)"
+echo -e ""
+echo -e "  بررسی وضعیت:"
+echo -e "  ${CYAN}systemctl status wg-api${NC}"
+echo -e "  ${CYAN}journalctl -u wg-api -f${NC}"
+echo ""
