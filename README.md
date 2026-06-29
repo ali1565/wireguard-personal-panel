@@ -6,4 +6,4 @@ cat > README.md << 'EOF'
 ## نصب سریع
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USERNAME/wg-panel/main/install.sh | bash
+curl -fsSL  https://github.com/ali1565/wireguard-personal-panel/blob/main/install-wg-panel-2.sh| bash
