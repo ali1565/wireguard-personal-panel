@@ -463,10 +463,8 @@ def regenerate_keys():
     try:
         priv = subprocess.check_output(["wg","genkey"]).decode().strip()
         pub  = subprocess.check_output(["wg","pubkey"],input=priv.encode()).decode().strip()
-        with open("/etc/wireguard/server_private.key","w") as f: f.write(priv+"
-")
-        with open("/etc/wireguard/server_public.key","w") as f:  f.write(pub+"
-")
+        with open("/etc/wireguard/server_private.key","w") as f: f.write(priv+"\n")
+        with open("/etc/wireguard/server_public.key","w") as f:  f.write(pub+"\n")
         import stat
         os.chmod("/etc/wireguard/server_private.key", stat.S_IRUSR|stat.S_IWUSR)
         # آپدیت wg0.conf
@@ -499,10 +497,8 @@ def import_server_key():
         if len(priv) != 44:
             return jsonify({"error":"کلید نامعتبر — باید ۴۴ کاراکتر باشد"}), 400
         pub=subprocess.check_output(["wg","pubkey"],input=priv.encode()).decode().strip()
-        with open("/etc/wireguard/server_private.key","w") as f: f.write(priv+"
-")
-        with open("/etc/wireguard/server_public.key","w") as f:  f.write(pub+"
-")
+        with open("/etc/wireguard/server_private.key","w") as f: f.write(priv+"\n")
+        with open("/etc/wireguard/server_public.key","w") as f:  f.write(pub+"\n")
         import stat
         os.chmod("/etc/wireguard/server_private.key", stat.S_IRUSR|stat.S_IWUSR)
         with open("/etc/wireguard/wg0.conf","r") as f: conf=f.read()
