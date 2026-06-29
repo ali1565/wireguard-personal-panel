@@ -14,7 +14,7 @@
 ## 🚀 نصب سریع
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USERNAME/wg-panel/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ali1565/wireguard-personal-panel/refs/heads/main/install.sh | bash
 ```
 
 ## پیش‌نیازها
