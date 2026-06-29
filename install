@@ -413,9 +413,137 @@ def restore():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ─── Priority / QoS ──────────────────────────────────
+PRIORITY_CLASSES = {
+    "vip":     {"label": "VIP",    "min_kbps": 5120,  "max_kbps": 0,     "prio": 1},
+    "normal":  {"label": "عادی",   "min_kbps": 1024,  "max_kbps": 0,     "prio": 2},
+    "limited": {"label": "محدود",  "min_kbps": 256,   "max_kbps": 2048,  "prio": 3},
+}
+
+def tc_rebuild_qos():
+    """بازسازی کامل QoS برای همه peers"""
+    db   = load_db()
+    iface = WG_IF
+    # پاک کردن همه قوانین
+    subprocess.run(f"tc qdisc del dev {iface} root 2>/dev/null", shell=True)
+    # ساخت HTB root
+    subprocess.run(f"tc qdisc add dev {iface} root handle 1: htb default 20", shell=True)
+    # کلاس‌های اصلی اولویت
+    subprocess.run(f"tc class add dev {iface} parent 1: classid 1:1  htb rate 1000mbit ceil 1000mbit prio 0", shell=True)
+    subprocess.run(f"tc class add dev {iface} parent 1:1 classid 1:10 htb rate 500mbit  ceil 1000mbit prio 1", shell=True)  # VIP
+    subprocess.run(f"tc class add dev {iface} parent 1:1 classid 1:20 htb rate 200mbit  ceil 800mbit  prio 2", shell=True)  # Normal
+    subprocess.run(f"tc class add dev {iface} parent 1:1 classid 1:30 htb rate 50mbit   ceil 200mbit  prio 3", shell=True)  # Limited
+    # اضافه کردن SFQ برای fairness داخل هر کلاس
+    for cid in ["10","20","30"]:
+        subprocess.run(f"tc qdisc add dev {iface} parent 1:{cid} handle {cid}: sfq perturb 10", shell=True)
+
+    active = wg_active_peers()
+    mark_counter = {}
+    for p in db["peers"]:
+        if p["pubkey"] not in active:
+            continue
+        priority = p.get("priority", "normal")
+        parent_class = {"vip":"10","normal":"20","limited":"30"}.get(priority,"20")
+        pc = PRIORITY_CLASSES.get(priority, PRIORITY_CLASSES["normal"])
+        ip = p["ip"]
+
+        # شناسه یکتا برای این peer
+        mark = sum(int(x) for x in ip.split(".")) % 900 + 100
+        while mark in mark_counter.values():
+            mark += 1
+        mark_counter[p["id"]] = mark
+
+        # کلاس اختصاصی برای peer
+        min_r = p.get("speedKbps", 0) if p.get("speedKbps",0) > 0 else pc["min_kbps"]
+        max_r = p.get("speedKbps", 0) if p.get("speedKbps",0) > 0 else (pc["max_kbps"] if pc["max_kbps"] > 0 else 1000000)
+        subprocess.run(
+            f"tc class add dev {iface} parent 1:{parent_class} classid 1:{mark} "
+            f"htb rate {min_r}kbit ceil {max_r}kbit prio {pc['prio']}",
+            shell=True
+        )
+        subprocess.run(
+            f"tc filter add dev {iface} parent 1: protocol ip prio 1 u32 "
+            f"match ip dst {ip}/32 flowid 1:{mark}",
+            shell=True
+        )
+
+@app.route("/api/peers/<pid>/priority", methods=["POST"])
+def set_priority(pid):
+    db   = load_db()
+    data = request.json or {}
+    prio = data.get("priority","normal")
+    if prio not in PRIORITY_CLASSES:
+        return jsonify({"error":"اولویت نامعتبر"}), 400
+    for p in db["peers"]:
+        if p["id"] == pid:
+            p["priority"] = prio
+            save_db(db)
+            tc_rebuild_qos()
+            return jsonify({"ok":True,"priority":prio})
+    return jsonify({"error":"یافت نشد"}), 404
+
+@app.route("/api/qos", methods=["GET"])
+def get_qos():
+    return jsonify(PRIORITY_CLASSES)
+
+# ─── Ping / Latency Monitor ──────────────────────────
+PING_HISTORY = {}   # {peer_ip: [(timestamp_ms, rtt_ms), ...]}  آخرین ۶۰ نقطه
+MAX_PING_HISTORY = 60
+
+def ping_peer(ip):
+    """پینگ یک peer و برگرداندن RTT به ms"""
+    try:
+        out = subprocess.check_output(
+            ["ping","-c","3","-W","2","-q", ip],
+            stderr=subprocess.DEVNULL, timeout=10
+        ).decode()
+        # خط: rtt min/avg/max/mdev = 1.234/2.345/3.456/0.500 ms
+        for line in out.splitlines():
+            if "rtt" in line or "round-trip" in line:
+                parts = line.split("=")[-1].strip().split("/")
+                return round(float(parts[1]), 2)   # avg
+    except:
+        pass
+    return None
+
+def bg_ping_monitor():
+    """پینگ همه peers فعال هر ۳۰ ثانیه"""
+    while True:
+        try:
+            db     = load_db()
+            active = wg_active_peers()
+            now    = int(time.time() * 1000)
+            for p in db["peers"]:
+                if p["pubkey"] not in active:
+                    continue
+                rtt = ping_peer(p["ip"])
+                ip  = p["ip"]
+                if ip not in PING_HISTORY:
+                    PING_HISTORY[ip] = []
+                PING_HISTORY[ip].append({"t": now, "rtt": rtt})
+                # نگه داشتن فقط آخرین MAX نقطه
+                if len(PING_HISTORY[ip]) > MAX_PING_HISTORY:
+                    PING_HISTORY[ip] = PING_HISTORY[ip][-MAX_PING_HISTORY:]
+        except Exception as e:
+            print(f"ping monitor error: {e}")
+        time.sleep(30)
+
+@app.route("/api/ping", methods=["GET"])
+def get_ping():
+    """برگرداندن تاریخچه پینگ همه peers"""
+    return jsonify(PING_HISTORY)
+
+@app.route("/api/ping/<ip>", methods=["GET"])
+def get_peer_ping(ip):
+    """تاریخچه پینگ یک peer خاص"""
+    clean_ip = ip.replace("-",".")   # support 10-8-0-2 format
+    return jsonify(PING_HISTORY.get(clean_ip, []))
+
 if __name__ == "__main__":
-    t = threading.Thread(target=bg_checker, daemon=True)
-    t.start()
+    t1 = threading.Thread(target=bg_checker, daemon=True)
+    t2 = threading.Thread(target=bg_ping_monitor, daemon=True)
+    t1.start()
+    t2.start()
     app.run(host="127.0.0.1", port=5000, debug=False)
 PYEOF
 
@@ -458,9 +586,59 @@ import { useState, useEffect, useCallback } from "react";
 import { AreaChart,Area,XAxis,YAxis,Tooltip,ResponsiveContainer,PieChart,Pie,Cell } from "recharts";
 import { QRCodeSVG } from "qrcode.react";
 
-const C={bg:"#0a0e1a",surface:"#111827",surfaceHover:"#1a2235",border:"#1e2d45",cyan:"#00d4ff",cyanDim:"#00d4ff22",green:"#00e676",orange:"#ff9100",red:"#ff1744",purple:"#7c3aed",text:"#e8edf5",textMuted:"#6b7fa3",textDim:"#3a4a6b"};
 const API=`${window.location.protocol}//${window.location.hostname}/api`;
-const PIE=[C.cyan,C.purple,C.green,C.orange,"#ec4899","#f43f5e","#06b6d4","#84cc16"];
+const PIE_COLORS=["#00d4ff","#7c3aed","#00e676","#ff9100","#ec4899","#f43f5e","#06b6d4","#84cc16"];
+
+// ── Themes ──────────────────────────────────────────
+const THEMES={
+  dark:{
+    name:"تیره",icon:"🌙",
+    bg:"#0a0e1a",surface:"#111827",surfaceHover:"#1a2235",
+    border:"#1e2d45",cyan:"#00d4ff",cyanDim:"#00d4ff22",
+    green:"#00e676",orange:"#ff9100",red:"#ff1744",purple:"#7c3aed",
+    text:"#e8edf5",textMuted:"#6b7fa3",textDim:"#3a4a6b",
+  },
+  light:{
+    name:"روشن",icon:"☀️",
+    bg:"#f0f4f8",surface:"#ffffff",surfaceHover:"#e8eef5",
+    border:"#d1dce8",cyan:"#0284c7",cyanDim:"#0284c722",
+    green:"#16a34a",orange:"#d97706",red:"#dc2626",purple:"#7c3aed",
+    text:"#0f172a",textMuted:"#64748b",textDim:"#94a3b8",
+  },
+  midnight:{
+    name:"نیمه‌شب",icon:"🌌",
+    bg:"#000000",surface:"#0d0d0d",surfaceHover:"#1a1a1a",
+    border:"#2a2a2a",cyan:"#a855f7",cyanDim:"#a855f722",
+    green:"#4ade80",orange:"#fb923c",red:"#f87171",purple:"#c084fc",
+    text:"#f1f5f9",textMuted:"#71717a",textDim:"#3f3f46",
+  },
+  ocean:{
+    name:"اقیانوس",icon:"🌊",
+    bg:"#0c1a2e",surface:"#0f2744",surfaceHover:"#163459",
+    border:"#1e4080",cyan:"#38bdf8",cyanDim:"#38bdf822",
+    green:"#34d399",orange:"#fbbf24",red:"#f87171",purple:"#818cf8",
+    text:"#e0f2fe",textMuted:"#7fb3d3",textDim:"#2d5986",
+  },
+  sunset:{
+    name:"غروب",icon:"🌅",
+    bg:"#1a0a0a",surface:"#2d1515",surfaceHover:"#3d1f1f",
+    border:"#5c2d2d",cyan:"#fb923c",cyanDim:"#fb923c22",
+    green:"#4ade80",orange:"#fbbf24",red:"#ef4444",purple:"#e879f9",
+    text:"#fef2f2",textMuted:"#d4a0a0",textDim:"#5c3333",
+  },
+  forest:{
+    name:"جنگل",icon:"🌿",
+    bg:"#0a1a0a",surface:"#0f2d0f",surfaceHover:"#163d16",
+    border:"#1e5c1e",cyan:"#4ade80",cyanDim:"#4ade8022",
+    green:"#86efac",orange:"#fbbf24",red:"#f87171",purple:"#a78bfa",
+    text:"#f0fdf4",textMuted:"#86a886",textDim:"#2d5c2d",
+  },
+};
+
+const THEME_STORAGE_KEY="wg-panel-theme";
+let _currentTheme=localStorage.getItem(THEME_STORAGE_KEY)||"dark";
+const getC=()=>THEMES[_currentTheme]||THEMES.dark;
+let C=getC();
 
 const fmt={
   bytes:(b)=>{if(!b||b<=0)return"0 B";if(b>=1e12)return(b/1e12).toFixed(2)+" TB";if(b>=1e9)return(b/1e9).toFixed(2)+" GB";if(b>=1e6)return(b/1e6).toFixed(2)+" MB";return(b/1e3).toFixed(1)+" KB";},
@@ -619,6 +797,198 @@ function LimitFields({maxGB,setMaxGB,speedKbps,setSpeedKbps,expiresAt,setExpires
       {expMode==="inf"&&<div style={{fontSize:11,color:C.textMuted}}>بدون تاریخ انقضا</div>}
     </Field>
   </>);
+}
+
+// ── Priority Badge ───────────────────────────────────
+const PRIO_CFG={
+  vip:    {label:"VIP",    icon:"⭐", color:"#f59e0b", bg:"#f59e0b22"},
+  normal: {label:"عادی",   icon:"👤", color:"#6b7fa3", bg:"#6b7fa322"},
+  limited:{label:"محدود",  icon:"🔻", color:"#94a3b8", bg:"#94a3b822"},
+};
+
+function PriorityBadge({priority="normal",onClick,small}){
+  const cfg=PRIO_CFG[priority]||PRIO_CFG.normal;
+  return(
+    <span onClick={onClick} title="تغییر اولویت" style={{display:"inline-flex",alignItems:"center",gap:4,padding:small?"2px 7px":"4px 10px",borderRadius:99,fontSize:small?10:11,fontWeight:700,background:cfg.bg,color:cfg.color,border:`1px solid ${cfg.color}44`,cursor:onClick?"pointer":"default",userSelect:"none"}}>
+      {cfg.icon} {cfg.label}
+    </span>
+  );
+}
+
+function PriorityModal({peer,onClose,onSave}){
+  const [prio,setPrio]=useState(peer.priority||"normal");
+  const save=async()=>{
+    try{
+      const r=await fetch(`${API}/peers/${peer.id}/priority`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({priority:prio})});
+      if(r.ok){onSave(prio);onClose();}
+    }catch{}
+  };
+  return(<ModalWrap onClose={onClose} width={360}>
+    <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:20}}>⚡ اولویت‌بندی — {peer.name}</div>
+    <div style={{display:"flex",flexDirection:"column",gap:10,marginBottom:20}}>
+      {Object.entries(PRIO_CFG).map(([key,cfg])=>(
+        <button key={key} onClick={()=>setPrio(key)} style={{padding:"14px 16px",borderRadius:10,border:`2px solid ${prio===key?cfg.color:C.border}`,background:prio===key?cfg.bg:C.bg,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:12,textAlign:"right",transition:"all .15s"}}>
+          <span style={{fontSize:24}}>{cfg.icon}</span>
+          <div style={{flex:1}}>
+            <div style={{fontSize:14,fontWeight:700,color:prio===key?cfg.color:C.text}}>{cfg.label}</div>
+            <div style={{fontSize:11,color:C.textMuted,marginTop:2}}>
+              {key==="vip"?"حداقل ۵ Mbps تضمین‌شده — بالاترین اولویت":key==="normal"?"حداقل ۱ Mbps — اولویت معمولی":"حداکثر ۲ Mbps — پایین‌ترین اولویت"}
+            </div>
+          </div>
+          {prio===key&&<span style={{color:cfg.color,fontSize:16}}>✓</span>}
+        </button>
+      ))}
+    </div>
+    <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 14px",fontSize:11,color:C.textMuted,marginBottom:16}}>
+      ⚡ اولویت‌بندی با tc HTB اعمال میشه — تغییر فوری و بدون قطعی
+    </div>
+    <div style={{display:"flex",gap:10}}>
+      <button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>انصراف</button>
+      <button onClick={save} style={{flex:2,padding:"11px 0",borderRadius:8,border:"none",background:C.cyan,color:C.bg,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>اعمال اولویت</button>
+    </div>
+  </ModalWrap>);
+}
+
+// ── Ping Chart Modal ──────────────────────────────────
+function PingModal({peer,onClose}){
+  const [data,setData]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [liveRtt,setLiveRtt]=useState(null);
+
+  const fetchPing=useCallback(async()=>{
+    try{
+      const r=await fetch(`${API}/ping/${peer.ip.replace(/\./g,"-")}`);
+      if(r.ok){
+        const d=await r.json();
+        const points=d.map((p,i)=>({
+          i:i+1,
+          t:new Date(p.t).toLocaleTimeString("fa-IR",{hour:"2-digit",minute:"2-digit"}),
+          rtt:p.rtt,
+        }));
+        setData(points);
+        if(points.length>0){
+          const last=points[points.length-1];
+          setLiveRtt(last.rtt);
+        }
+      }
+    }catch{}
+    setLoading(false);
+  },[peer.ip]);
+
+  useEffect(()=>{
+    fetchPing();
+    const t=setInterval(fetchPing,15000);
+    return()=>clearInterval(t);
+  },[fetchPing]);
+
+  const validData=data.filter(d=>d.rtt!==null);
+  const avgRtt=validData.length>0?Math.round(validData.reduce((s,d)=>s+d.rtt,0)/validData.length):null;
+  const minRtt=validData.length>0?Math.min(...validData.map(d=>d.rtt)):null;
+  const maxRtt=validData.length>0?Math.max(...validData.map(d=>d.rtt)):null;
+  const lossCount=data.filter(d=>d.rtt===null).length;
+  const lossPct=data.length>0?Math.round((lossCount/data.length)*100):0;
+
+  const rttColor=(rtt)=>rtt===null?C.red:rtt<50?C.green:rtt<150?C.orange:C.red;
+
+  return(<ModalWrap onClose={onClose} width={580}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+      <div>
+        <div style={{fontSize:12,color:C.textMuted}}>نمودار پینگ</div>
+        <div style={{fontSize:18,fontWeight:700,color:C.text}}>{peer.name} — {peer.ip}</div>
+      </div>
+      <button onClick={onClose} style={{background:"transparent",border:`1px solid ${C.border}`,color:C.textMuted,borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:16}}>✕</button>
+    </div>
+
+    {/* Live RTT */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:20}}>
+      {[
+        {label:"RTT فعلی",value:liveRtt!=null?`${liveRtt} ms`:"—",color:liveRtt!=null?rttColor(liveRtt):C.textMuted},
+        {label:"میانگین",value:avgRtt!=null?`${avgRtt} ms`:"—",color:avgRtt!=null?rttColor(avgRtt):C.textMuted},
+        {label:"کمترین",value:minRtt!=null?`${minRtt} ms`:"—",color:C.green},
+        {label:"packet loss",value:`${lossPct}%`,color:lossPct>5?C.red:lossPct>0?C.orange:C.green},
+      ].map(({label,value,color})=>(
+        <div key={label} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px",textAlign:"center"}}>
+          <div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>{label}</div>
+          <div style={{fontSize:20,fontWeight:800,color,fontFamily:"monospace"}}>{value}</div>
+        </div>
+      ))}
+    </div>
+
+    {/* Chart */}
+    {loading?(
+      <div style={{height:200,display:"flex",alignItems:"center",justifyContent:"center",color:C.textMuted}}>⏳ در حال بارگذاری...</div>
+    ):data.length===0?(
+      <div style={{height:200,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",color:C.textMuted,gap:8}}>
+        <div style={{fontSize:32}}>📡</div>
+        <div style={{fontSize:13}}>داده‌ای موجود نیست</div>
+        <div style={{fontSize:11}}>کاربر باید آنلاین باشد — هر ۳۰ ثانیه یکبار اندازه‌گیری میشه</div>
+      </div>
+    ):(
+      <ResponsiveContainer width="100%" height={200}>
+        <AreaChart data={data} margin={{top:5,right:5,left:0,bottom:5}}>
+          <defs>
+            <linearGradient id="rttGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%"  stopColor={C.cyan} stopOpacity={0.4}/>
+              <stop offset="95%" stopColor={C.cyan} stopOpacity={0}/>
+            </linearGradient>
+          </defs>
+          <XAxis dataKey="t" tick={{fill:C.textDim,fontSize:9}} axisLine={false} tickLine={false} interval="preserveStartEnd"/>
+          <YAxis tick={{fill:C.textDim,fontSize:9}} axisLine={false} tickLine={false} unit="ms"/>
+          <Tooltip
+            contentStyle={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,color:C.text,fontSize:12}}
+            formatter={(v)=>v!=null?[`${v} ms`,"RTT"]:["timeout","RTT"]}
+          />
+          <Area type="monotone" dataKey="rtt" stroke={C.cyan} fill="url(#rttGrad)" strokeWidth={2} connectNulls={false} dot={(props)=>{
+            const {cx,cy,payload}=props;
+            if(payload.rtt===null)return<circle key={props.key} cx={cx} cy={cy||10} r={4} fill={C.red}/>;
+            return<circle key={props.key} cx={cx} cy={cy} r={2} fill={C.cyan}/>;
+          }}/>
+        </AreaChart>
+      </ResponsiveContainer>
+    )}
+
+    {/* کیفیت اتصال */}
+    {avgRtt!=null&&(
+      <div style={{marginTop:16,padding:"10px 14px",borderRadius:10,background:rttColor(avgRtt)+"11",border:`1px solid ${rttColor(avgRtt)}44`,fontSize:12,color:rttColor(avgRtt),textAlign:"center",fontWeight:600}}>
+        {avgRtt<50?"🟢 کیفیت عالی":avgRtt<150?"🟡 کیفیت متوسط":"🔴 کیفیت ضعیف"}
+        {" — "}
+        {avgRtt<50?"اتصال پایدار و سریع":avgRtt<150?"قابل قبول برای استفاده معمولی":"تأخیر بالا — بررسی شبکه توصیه میشه"}
+      </div>
+    )}
+
+    <div style={{marginTop:10,fontSize:10,color:C.textDim,textAlign:"center"}}>اندازه‌گیری هر ۳۰ ثانیه — آخرین {data.length} نقطه نمایش داده میشه</div>
+  </ModalWrap>);
+}
+
+// ── Theme Switcher ───────────────────────────────────
+function ThemeModal({onClose,currentTheme,onThemeChange}){
+  return(<ModalWrap onClose={onClose} width={480}>
+    <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:24}}>🎨 انتخاب تم</div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
+      {Object.entries(THEMES).map(([key,th])=>{
+        const isActive=currentTheme===key;
+        return(
+          <button key={key} onClick={()=>{onThemeChange(key);onClose();}} style={{
+            padding:"16px 12px",borderRadius:12,cursor:"pointer",fontFamily:"inherit",
+            border:`2px solid ${isActive?th.cyan:th.border}`,
+            background:th.bg, transition:"all .2s",
+            boxShadow:isActive?`0 0 20px ${th.cyan}44`:"none",
+          }}>
+            <div style={{fontSize:28,marginBottom:8}}>{th.icon}</div>
+            <div style={{fontSize:13,fontWeight:700,color:th.text,marginBottom:6}}>{th.name}</div>
+            {/* Color preview dots */}
+            <div style={{display:"flex",gap:4,justifyContent:"center",marginBottom:8}}>
+              {[th.bg,th.surface,th.cyan,th.green,th.purple].map((col,i)=>(
+                <div key={i} style={{width:10,height:10,borderRadius:"50%",background:col,border:`1px solid ${th.border}`}}/>
+              ))}
+            </div>
+            {isActive&&<div style={{fontSize:10,color:th.cyan,fontWeight:700}}>✓ فعال</div>}
+          </button>
+        );
+      })}
+    </div>
+    <div style={{marginTop:16,fontSize:11,color:C.textMuted,textAlign:"center"}}>تم انتخابی در مرورگر ذخیره می‌شود</div>
+  </ModalWrap>);
 }
 
 // ── Login ─────────────────────────────────────────────
@@ -912,6 +1282,17 @@ export default function App(){
   const [addingUser,setAddingUser]=useState(false);
   const [changingPass,setChangingPass]=useState(false);
   const [backupModal,setBackupModal]=useState(false);
+  const [themeModal,setThemeModal]=useState(false);
+  const [priorityPeer,setPriorityPeer]=useState(null);
+  const [pingPeer,setPingPeer]=useState(null);
+  const [theme,setTheme]=useState(_currentTheme);
+
+  const applyTheme=(key)=>{
+    _currentTheme=key;
+    C=getC();
+    localStorage.setItem(THEME_STORAGE_KEY,key);
+    setTheme(key);
+  };
   const [confirmDel,setConfirmDel]=useState(null);
   const [toast,setToast]=useState(null);
   const [tab,setTab]=useState("peers");
@@ -944,8 +1325,8 @@ export default function App(){
   if(!loggedIn)return <LoginPage onLogin={()=>setLoggedIn(true)}/>;
 
   return(
-    <div dir="rtl" style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'Vazirmatn','Segoe UI',sans-serif",paddingBottom:40}}>
-      <style>{`@keyframes pulse{0%{opacity:.8;transform:scale(1)}100%{opacity:0;transform:scale(2.4)}}*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:${C.bg}}::-webkit-scrollbar-thumb{background:${C.border};border-radius:3px}button:hover{opacity:.85}input[type=date]::-webkit-calendar-picker-indicator{filter:invert(1)}`}</style>
+    <div key={theme} dir="rtl" style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'Vazirmatn','Segoe UI',sans-serif",paddingBottom:40}}>
+      <style>{`@keyframes pulse{0%{opacity:.8;transform:scale(1)}100%{opacity:0;transform:scale(2.4)}}*{box-sizing:border-box;margin:0;padding:0}::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:${C.bg}}::-webkit-scrollbar-thumb{background:${C.border};border-radius:3px}button:hover{opacity:.85}input[type=date]::-webkit-calendar-picker-indicator{filter:${theme==="light"?"none":"invert(1)"}}body{background:${C.bg}}`}</style>
 
       {/* Header */}
       <div style={{borderBottom:`1px solid ${C.border}`,padding:"16px 32px",display:"flex",alignItems:"center",justifyContent:"space-between",background:`${C.surface}dd`,backdropFilter:"blur(10px)",position:"sticky",top:0,zIndex:50}}>
@@ -955,6 +1336,9 @@ export default function App(){
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
           <button onClick={()=>setAddingUser(true)} style={{padding:"8px 16px",borderRadius:8,border:"none",background:`linear-gradient(135deg,${C.cyan},${C.purple})`,color:C.bg,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>➕ کاربر جدید</button>
+          <button onClick={()=>setThemeModal(true)} title={`تم: ${THEMES[theme]?.name}`} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>
+            {THEMES[theme]?.icon} تم
+          </button>
           <button onClick={()=>setBackupModal(true)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>💾 بکاپ</button>
           <button onClick={()=>setChangingPass(true)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>🔑 رمز</button>
           <button onClick={()=>setLoggedIn(false)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>خروج</button>
@@ -995,11 +1379,14 @@ export default function App(){
               const isSel=selected===p.id;
               return(
                 <div key={p.id} style={{background:isSel?C.surfaceHover:C.surface,border:`1px solid ${isSel?C.cyan+"55":isExpired?C.red+"44":C.border}`,borderRadius:14,overflow:"hidden",transition:"all .2s"}}>
-                  <div onClick={()=>setSelected(isSel?null:p.id)} style={{padding:"14px 20px",cursor:"pointer",display:"grid",alignItems:"center",gridTemplateColumns:"26px 1fr 90px 150px 130px 90px 180px",gap:10}}>
+                  <div onClick={()=>setSelected(isSel?null:p.id)} style={{padding:"14px 20px",cursor:"pointer",display:"grid",alignItems:"center",gridTemplateColumns:"26px 1fr 80px 140px 130px 80px 170px",gap:10}}>
                     <PulseRing active={p.active} blocked={isBlocked} expired={isExpired}/>
                     <div>
-                      <div style={{fontWeight:700,fontSize:14}}>{p.name}</div>
-                      <div style={{fontSize:11,color:C.textMuted,fontFamily:"monospace",marginTop:2}}>{p.ip}</div>
+                      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2}}>
+                        <span style={{fontWeight:700,fontSize:14}}>{p.name}</span>
+                        <PriorityBadge priority={p.priority||"normal"} small onClick={e=>{e.stopPropagation();setPriorityPeer(p);}}/>
+                      </div>
+                      <div style={{fontSize:11,color:C.textMuted,fontFamily:"monospace"}}>{p.ip}</div>
                     </div>
                     <div style={{textAlign:"center"}}>
                       <div style={{fontSize:10,color:C.textMuted,marginBottom:2}}>مصرف</div>
@@ -1026,7 +1413,8 @@ export default function App(){
                       </span>
                     </div>
                     <div style={{display:"flex",gap:4,justifyContent:"flex-end"}}>
-                      <Btn onClick={e=>{e.stopPropagation();setConfigPeer(p);}} color={C.cyan} title="QR / کانفیگ">📱</Btn>
+                      <Btn onClick={e=>{e.stopPropagation();setPingPeer(p);}} color={C.cyan} title="نمودار پینگ">📡</Btn>
+                      <Btn onClick={e=>{e.stopPropagation();setConfigPeer(p);}} color={C.purple} title="QR / کانفیگ">📱</Btn>
                       <Btn onClick={e=>{e.stopPropagation();togglePeer(p.id);}} color={p.active?C.orange:C.green} title={p.active?"قطع":"وصل"}>{p.active?"⏸":"▶"}</Btn>
                       <Btn onClick={e=>{e.stopPropagation();setEditing(p);}} color={C.textMuted} title="ویرایش">✏️</Btn>
                       <Btn onClick={e=>{e.stopPropagation();resetPeer(p.id);}} color={C.textDim} title="ریست مصرف">↺</Btn>
@@ -1034,7 +1422,7 @@ export default function App(){
                     </div>
                   </div>
                   {isSel&&(
-                    <div style={{borderTop:`1px solid ${C.border}`,padding:"12px 20px",display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:14,background:C.bg+"44"}}>
+                    <div style={{borderTop:`1px solid ${C.border}`,padding:"12px 20px",display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:10,background:C.bg+"44"}}>
                       <div><div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>آخرین اتصال</div><div style={{fontSize:12,fontFamily:"monospace",color:C.text}}>{fmt.time(p.lastSeen)}</div></div>
                       <div><div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>حجم مجاز</div><div style={{fontSize:12,fontFamily:"monospace",color:C.text}}>{fmt.vol(p.maxBytes||0)}</div></div>
                       <div><div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>سرعت مجاز</div><div style={{fontSize:12,fontFamily:"monospace",color:C.text}}>{fmt.speed(p.speedKbps||0)}</div></div>
@@ -1069,10 +1457,10 @@ export default function App(){
             <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,padding:24}}>
               <div style={{fontSize:13,color:C.textMuted,marginBottom:16}}>سهم مصرف</div>
               <ResponsiveContainer width="100%" height={180}>
-                <PieChart><Pie data={pieData} dataKey="value" innerRadius={50} outerRadius={80} paddingAngle={3}>{pieData.map((_,i)=><Cell key={i} fill={PIE[i%PIE.length]}/>)}</Pie><Tooltip formatter={v=>fmt.bytes(v)} contentStyle={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,color:C.text}}/></PieChart>
+                <PieChart><Pie data={pieData} dataKey="value" innerRadius={50} outerRadius={80} paddingAngle={3}>{pieData.map((_,i)=><Cell key={i} fill={PIE_COLORS[i%PIE_COLORS.length]}/>)}</Pie><Tooltip formatter={v=>fmt.bytes(v)} contentStyle={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,color:C.text}}/></PieChart>
               </ResponsiveContainer>
               <div style={{display:"flex",flexDirection:"column",gap:8,marginTop:8}}>
-                {peers.map((p,i)=>(<div key={p.id} style={{display:"flex",alignItems:"center",gap:8}}><div style={{width:8,height:8,borderRadius:"50%",background:PIE[i%PIE.length],flexShrink:0}}/><span style={{fontSize:12,color:C.textMuted,flex:1}}>{p.name}</span><span style={{fontSize:12,fontFamily:"monospace",color:C.text}}>{fmt.bytes(p.usedBytes||0)}</span></div>))}
+                {peers.map((p,i)=>(<div key={p.id} style={{display:"flex",alignItems:"center",gap:8}}><div style={{width:8,height:8,borderRadius:"50%",background:PIE_COLORS[i%PIE_COLORS.length],flexShrink:0}}/><span style={{fontSize:12,color:C.textMuted,flex:1}}>{p.name}</span><span style={{fontSize:12,fontFamily:"monospace",color:C.text}}>{fmt.bytes(p.usedBytes||0)}</span></div>))}
               </div>
             </div>
             <div style={{gridColumn:"1/-1",background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,padding:24}}>
@@ -1111,6 +1499,9 @@ export default function App(){
       {configPeer&&<ConfigModal peer={configPeer} serverInfo={serverInfo} onClose={()=>setConfigPeer(null)}/>}
       {editing&&<EditModal peer={editing} onClose={()=>setEditing(null)} onSave={(d)=>{setPeers(p=>p.map(x=>x.id===d.id?{...x,...d}:x));showToast("تنظیمات ذخیره شد");}}/>}
       {addingUser&&<AddUserModal onClose={()=>setAddingUser(false)} onAdd={(p)=>{setPeers(prev=>[...prev,{...p,usedBytes:0,active:false}]);showToast(`${p.name} اضافه شد`);}}/>}
+      {priorityPeer&&<PriorityModal peer={priorityPeer} onClose={()=>setPriorityPeer(null)} onSave={(prio)=>{setPeers(prev=>prev.map(x=>x.id===priorityPeer.id?{...x,priority:prio}:x));showToast(`اولویت ${priorityPeer.name} تغییر کرد`);}}/>}
+      {pingPeer&&<PingModal peer={pingPeer} onClose={()=>setPingPeer(null)}/>}
+      {themeModal&&<ThemeModal onClose={()=>setThemeModal(false)} currentTheme={theme} onThemeChange={applyTheme}/>}
       {backupModal&&<BackupModal onClose={()=>setBackupModal(false)} showToast={showToast} onRestore={fetchPeers}/>}
       {changingPass&&<ChangePassModal onClose={()=>setChangingPass(false)} showToast={showToast}/>}
       {toast&&<div style={{position:"fixed",bottom:28,left:"50%",transform:"translateX(-50%)",background:toast.color,color:C.bg,padding:"10px 24px",borderRadius:99,fontWeight:700,fontSize:13,zIndex:500,boxShadow:"0 4px 20px #0006"}}>{toast.msg}</div>}
@@ -1172,4 +1563,3 @@ echo -e "  بررسی وضعیت:"
 echo -e "  ${CYAN}systemctl status wg-api${NC}"
 echo -e "  ${CYAN}journalctl -u wg-api -f${NC}"
 echo ""
-                  
