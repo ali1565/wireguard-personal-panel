@@ -348,6 +348,71 @@ def reset_usage(pid):
     save_db(db)
     return jsonify({"ok": True})
 
+@app.route("/api/backup", methods=["GET"])
+def backup():
+    import datetime
+    db  = load_db()
+    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    payload = {
+        "version":   1,
+        "createdAt": int(time.time()*1000),
+        "serverPub": open("/etc/wireguard/server_public.key").read().strip(),
+        "peers":     db["peers"],
+    }
+    from flask import Response
+    resp = Response(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        mimetype="application/json",
+        headers={"Content-Disposition": f"attachment; filename=wg-backup-{now}.json"}
+    )
+    return resp
+
+@app.route("/api/restore", methods=["POST"])
+def restore():
+    try:
+        data   = request.json or {}
+        peers  = data.get("peers", [])
+        mode   = data.get("mode", "merge")
+        if not isinstance(peers, list):
+            return jsonify({"error": "فرمت نادرست"}), 400
+        db = load_db()
+        existing_ids  = {p["id"]  for p in db["peers"]}
+        existing_ips  = {p["ip"]  for p in db["peers"]}
+        existing_keys = {p["pubkey"] for p in db["peers"]}
+        if mode == "replace":
+            for p in db["peers"]:
+                wg_remove_peer(p["pubkey"])
+            db["peers"] = []
+            existing_ids = set(); existing_ips = set(); existing_keys = set()
+        added = 0; skipped = 0
+        for p in peers:
+            pid    = p.get("id","")
+            pubkey = p.get("pubkey","")
+            ip     = p.get("ip","")
+            if mode == "merge" and (pid in existing_ids or pubkey in existing_keys):
+                skipped += 1
+                continue
+            if ip in existing_ips:
+                ip = next_ip()
+                if not ip:
+                    skipped += 1
+                    continue
+                p["ip"] = ip
+            db["peers"].append(p)
+            existing_ids.add(pid); existing_ips.add(ip); existing_keys.add(pubkey)
+            try:
+                if not is_expired(p) and not p.get("volBlocked") and not p.get("expBlocked"):
+                    wg_add_peer(pubkey, ip)
+                    if p.get("speedKbps",0) > 0:
+                        tc_apply(ip, p["speedKbps"])
+            except Exception as e:
+                print(f"wg_add error: {e}")
+            added += 1
+        save_db(db)
+        return jsonify({"ok": True, "added": added, "skipped": skipped})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
     t = threading.Thread(target=bg_checker, daemon=True)
     t.start()
@@ -670,6 +735,146 @@ function ConfigModal({peer,serverInfo,onClose}){
   </ModalWrap>);
 }
 
+// ── Backup / Restore Modal ───────────────────────────
+function BackupModal({onClose,showToast,onRestore}){
+  const [tab,setTab]=useState("backup");
+  const [restoreMode,setRestoreMode]=useState("merge");
+  const [file,setFile]=useState(null);
+  const [fileData,setFileData]=useState(null);
+  const [loading,setLoading]=useState(false);
+  const [preview,setPreview]=useState(null);
+
+  const doBackup=async()=>{
+    try{
+      const r=await fetch(`${API}/backup`);
+      if(!r.ok){showToast("خطا در بکاپ",C.red);return;}
+      const blob=await r.blob();
+      const url=URL.createObjectURL(blob);
+      const a=document.createElement("a");
+      a.href=url;
+      const now=new Date().toISOString().slice(0,10).replace(/-/g,"");
+      a.download=`wg-backup-${now}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast("بکاپ دانلود شد ✓");
+    }catch{showToast("خطا در بکاپ",C.red);}
+  };
+
+  const onFileChange=async(e)=>{
+    const f=e.target.files[0];
+    if(!f){setFile(null);setFileData(null);setPreview(null);return;}
+    setFile(f);
+    try{
+      const text=await f.text();
+      const json=JSON.parse(text);
+      setFileData(json);
+      setPreview({count:json.peers?.length||0,date:json.createdAt?new Date(json.createdAt).toLocaleDateString("fa-IR"):"نامشخص",server:json.serverPub?.slice(0,20)+"..."});
+    }catch{showToast("فایل نامعتبر است",C.red);setFile(null);setFileData(null);}
+  };
+
+  const doRestore=async()=>{
+    if(!fileData?.peers){showToast("فایل بکاپ معتبر نیست",C.red);return;}
+    setLoading(true);
+    try{
+      const r=await fetch(`${API}/restore`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({peers:fileData.peers,mode:restoreMode})});
+      const d=await r.json();
+      if(r.ok){
+        showToast(`✓ ${d.added} کاربر بازیابی شد${d.skipped>0?` (${d.skipped} رد شد)`:""}`);
+        onRestore();onClose();
+      }else{showToast(d.error||"خطا در بازیابی",C.red);}
+    }catch{showToast("خطا در اتصال",C.red);}
+    setLoading(false);
+  };
+
+  const btnStyle=(active)=>({flex:1,padding:"8px 0",borderRadius:7,border:`1px solid ${active?C.cyan:C.border}`,background:active?C.cyan+"22":"transparent",color:active?C.cyan:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit",fontWeight:active?700:400});
+
+  return(<ModalWrap onClose={onClose} width={460}>
+    <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:20}}>💾 بکاپ و بازیابی</div>
+
+    {/* Tabs */}
+    <div style={{display:"flex",gap:4,background:C.bg,borderRadius:10,padding:4,marginBottom:20}}>
+      <button onClick={()=>setTab("backup")} style={btnStyle(tab==="backup")}>⬇ دریافت بکاپ</button>
+      <button onClick={()=>setTab("restore")} style={btnStyle(tab==="restore")}>⬆ بازیابی</button>
+    </div>
+
+    {/* Backup Tab */}
+    {tab==="backup"&&(
+      <div style={{display:"flex",flexDirection:"column",gap:16}}>
+        <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:12,padding:20,textAlign:"center"}}>
+          <div style={{fontSize:40,marginBottom:12}}>📦</div>
+          <div style={{fontSize:14,color:C.text,fontWeight:600,marginBottom:6}}>بکاپ کامل کاربران</div>
+          <div style={{fontSize:12,color:C.textMuted,marginBottom:16,lineHeight:1.6}}>
+            تمام اطلاعات کاربران شامل کلیدها، IP، محدودیت‌ها و تاریخ انقضا در یک فایل JSON ذخیره می‌شود
+          </div>
+          <button onClick={doBackup} style={{padding:"11px 28px",borderRadius:9,border:"none",background:`linear-gradient(135deg,${C.cyan},${C.purple})`,color:C.bg,cursor:"pointer",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>
+            ⬇ دانلود فایل بکاپ
+          </button>
+        </div>
+        <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 16px"}}>
+          <div style={{fontSize:11,color:C.textMuted,marginBottom:8}}>فایل بکاپ شامل:</div>
+          {["کلید خصوصی و عمومی هر کاربر","آدرس IP هر کاربر","محدودیت حجم و سرعت","تاریخ انقضا","وضعیت مسدود/فعال"].map(i=>(
+            <div key={i} style={{fontSize:11,color:C.textMuted,padding:"2px 0"}}>✓ {i}</div>
+          ))}
+        </div>
+      </div>
+    )}
+
+    {/* Restore Tab */}
+    {tab==="restore"&&(
+      <div style={{display:"flex",flexDirection:"column",gap:16}}>
+        {/* آپلود فایل */}
+        <div>
+          <div style={{fontSize:12,color:C.textMuted,marginBottom:8}}>فایل بکاپ JSON را انتخاب کنید</div>
+          <label style={{display:"block",border:`2px dashed ${file?C.cyan:C.border}`,borderRadius:10,padding:"20px",textAlign:"center",cursor:"pointer",background:file?C.cyan+"08":C.bg,transition:"all .2s"}}>
+            <input type="file" accept=".json" onChange={onFileChange} style={{display:"none"}}/>
+            <div style={{fontSize:28,marginBottom:8}}>{file?"✅":"📂"}</div>
+            <div style={{fontSize:13,color:file?C.cyan:C.textMuted}}>{file?file.name:"کلیک کنید یا فایل را بکشید"}</div>
+          </label>
+        </div>
+
+        {/* پیش‌نمایش */}
+        {preview&&(
+          <div style={{background:C.bg,border:`1px solid ${C.cyan}44`,borderRadius:10,padding:"14px 16px"}}>
+            <div style={{fontSize:12,color:C.cyan,fontWeight:700,marginBottom:10}}>📋 اطلاعات فایل بکاپ</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              {[["تعداد کاربران",preview.count+" نفر"],["تاریخ بکاپ",preview.date],["کلید سرور",preview.server]].map(([l,v])=>(
+                <div key={l}><div style={{fontSize:10,color:C.textMuted}}>{l}</div><div style={{fontSize:12,fontFamily:"monospace",color:C.text,marginTop:2}}>{v}</div></div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* حالت بازیابی */}
+        {preview&&(
+          <div>
+            <div style={{fontSize:12,color:C.textMuted,marginBottom:8}}>حالت بازیابی</div>
+            <div style={{display:"flex",gap:8}}>
+              {[["merge","ادغام با کاربران فعلی"],["replace","جایگزینی کامل"]].map(([m,l])=>(
+                <button key={m} onClick={()=>setRestoreMode(m)} style={{flex:1,padding:"9px 0",borderRadius:8,border:`1px solid ${restoreMode===m?C.cyan:C.border}`,background:restoreMode===m?C.cyan+"22":"transparent",color:restoreMode===m?C.cyan:C.textMuted,cursor:"pointer",fontSize:12,fontFamily:"inherit",fontWeight:restoreMode===m?700:400}}>
+                  {m==="merge"?"🔀 ادغام":"🔄 جایگزینی"}
+                  <div style={{fontSize:10,opacity:.7,marginTop:2}}>{l}</div>
+                </button>
+              ))}
+            </div>
+            {restoreMode==="replace"&&(
+              <div style={{background:C.red+"11",border:`1px solid ${C.red}44`,borderRadius:8,padding:"10px 14px",marginTop:10,fontSize:11,color:C.red}}>
+                ⚠️ تمام کاربران فعلی حذف و با کاربران بکاپ جایگزین می‌شوند
+              </div>
+            )}
+          </div>
+        )}
+
+        <div style={{display:"flex",gap:10,marginTop:4}}>
+          <button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>انصراف</button>
+          <button onClick={doRestore} disabled={!file||loading} style={{flex:2,padding:"11px 0",borderRadius:8,border:"none",background:file?C.cyan:"#333",color:file?C.bg:C.textDim,cursor:file&&!loading?"pointer":"not-allowed",fontSize:14,fontWeight:700,fontFamily:"inherit",opacity:loading?0.7:1}}>
+            {loading?"در حال بازیابی...":"⬆ بازیابی کاربران"}
+          </button>
+        </div>
+      </div>
+    )}
+  </ModalWrap>);
+}
+
 // ── Edit Modal ────────────────────────────────────────
 function EditModal({peer,onClose,onSave}){
   const [name,setName]=useState(peer.name);
@@ -706,6 +911,7 @@ export default function App(){
   const [configPeer,setConfigPeer]=useState(null);
   const [addingUser,setAddingUser]=useState(false);
   const [changingPass,setChangingPass]=useState(false);
+  const [backupModal,setBackupModal]=useState(false);
   const [confirmDel,setConfirmDel]=useState(null);
   const [toast,setToast]=useState(null);
   const [tab,setTab]=useState("peers");
@@ -749,6 +955,7 @@ export default function App(){
         </div>
         <div style={{display:"flex",gap:8,alignItems:"center"}}>
           <button onClick={()=>setAddingUser(true)} style={{padding:"8px 16px",borderRadius:8,border:"none",background:`linear-gradient(135deg,${C.cyan},${C.purple})`,color:C.bg,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>➕ کاربر جدید</button>
+          <button onClick={()=>setBackupModal(true)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>💾 بکاپ</button>
           <button onClick={()=>setChangingPass(true)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>🔑 رمز</button>
           <button onClick={()=>setLoggedIn(false)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>خروج</button>
         </div>
@@ -904,6 +1111,7 @@ export default function App(){
       {configPeer&&<ConfigModal peer={configPeer} serverInfo={serverInfo} onClose={()=>setConfigPeer(null)}/>}
       {editing&&<EditModal peer={editing} onClose={()=>setEditing(null)} onSave={(d)=>{setPeers(p=>p.map(x=>x.id===d.id?{...x,...d}:x));showToast("تنظیمات ذخیره شد");}}/>}
       {addingUser&&<AddUserModal onClose={()=>setAddingUser(false)} onAdd={(p)=>{setPeers(prev=>[...prev,{...p,usedBytes:0,active:false}]);showToast(`${p.name} اضافه شد`);}}/>}
+      {backupModal&&<BackupModal onClose={()=>setBackupModal(false)} showToast={showToast} onRestore={fetchPeers}/>}
       {changingPass&&<ChangePassModal onClose={()=>setChangingPass(false)} showToast={showToast}/>}
       {toast&&<div style={{position:"fixed",bottom:28,left:"50%",transform:"translateX(-50%)",background:toast.color,color:C.bg,padding:"10px 24px",borderRadius:99,fontWeight:700,fontSize:13,zIndex:500,boxShadow:"0 4px 20px #0006"}}>{toast.msg}</div>}
     </div>
@@ -964,3 +1172,4 @@ echo -e "  بررسی وضعیت:"
 echo -e "  ${CYAN}systemctl status wg-api${NC}"
 echo -e "  ${CYAN}journalctl -u wg-api -f${NC}"
 echo ""
+                  
