@@ -38,6 +38,9 @@ mkdir -p /etc/wireguard
 if [[ ! -f /etc/wireguard/server_private.key ]]; then
   wg genkey | tee /etc/wireguard/server_private.key | wg pubkey > /etc/wireguard/server_public.key
   chmod 600 /etc/wireguard/server_private.key
+  ok "کلید جدید سرور ساخته شد"
+else
+  warn "کلید سرور قبلاً وجود دارد — حفظ می‌شود (کانفیگ کاربران همچنان کار می‌کند)"
 fi
 SRV_PRIV=$(cat /etc/wireguard/server_private.key)
 SRV_PUB=$(cat /etc/wireguard/server_public.key)
@@ -49,10 +52,32 @@ cat > /etc/wireguard/wg0.conf << WGEOF
 Address = 10.8.0.1/24
 ListenPort = 51820
 PrivateKey = ${SRV_PRIV}
+MTU = 1420
 PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${MAIN_IF} -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${MAIN_IF} -j MASQUERADE
 WGEOF
 fi
+
+# بهینه‌سازی شبکه برای اتصال سریع‌تر
+info "بهینه‌سازی شبکه..."
+cat >> /etc/sysctl.conf << SYSCTLEOF
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 67108864
+net.core.wmem_default = 67108864
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.core.netdev_max_backlog = 5000
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+SYSCTLEOF
+# فعال کردن BBR
+modprobe tcp_bbr 2>/dev/null || true
+echo "tcp_bbr" >> /etc/modules-load.d/modules.conf 2>/dev/null || true
+sysctl -p > /dev/null 2>&1
+ok "بهینه‌سازی شبکه انجام شد"
 systemctl enable wg-quick@wg0 > /dev/null 2>&1
 systemctl restart wg-quick@wg0 2>/dev/null && ok "WireGuard wg0 فعال شد" || warn "wg0 راه‌اندازی نشد"
 
@@ -353,11 +378,14 @@ def backup():
     import datetime
     db  = load_db()
     now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    srv_priv = open("/etc/wireguard/server_private.key").read().strip()
+    srv_pub  = open("/etc/wireguard/server_public.key").read().strip()
     payload = {
-        "version":   1,
-        "createdAt": int(time.time()*1000),
-        "serverPub": open("/etc/wireguard/server_public.key").read().strip(),
-        "peers":     db["peers"],
+        "version":        1,
+        "createdAt":      int(time.time()*1000),
+        "serverPub":      srv_pub,
+        "serverPriv":     srv_priv,   # برای restore کامل روی سرور جدید
+        "peers":          db["peers"],
     }
     from flask import Response
     resp = Response(
@@ -373,8 +401,24 @@ def restore():
         data   = request.json or {}
         peers  = data.get("peers", [])
         mode   = data.get("mode", "merge")
+        restore_key = data.get("restoreServerKey", False)
         if not isinstance(peers, list):
             return jsonify({"error": "فرمت نادرست"}), 400
+
+        # اگه کلید سرور در بکاپ بود و کاربر خواست restore کنه
+        if restore_key and data.get("serverPriv"):
+            priv = data["serverPriv"].strip()
+            if len(priv) == 44:
+                pub = subprocess.check_output(["wg","pubkey"],input=priv.encode()).decode().strip()
+                with open("/etc/wireguard/server_private.key","w") as f: f.write(priv+"\n")
+                with open("/etc/wireguard/server_public.key","w") as f:  f.write(pub+"\n")
+                import stat, re
+                os.chmod("/etc/wireguard/server_private.key", stat.S_IRUSR|stat.S_IWUSR)
+                with open("/etc/wireguard/wg0.conf","r") as f: conf=f.read()
+                conf=re.sub(r"PrivateKey = \S+", f"PrivateKey = {priv}", conf)
+                with open("/etc/wireguard/wg0.conf","w") as f: f.write(conf)
+                subprocess.run(["systemctl","restart","wg-quick@wg0"],check=False)
+                time.sleep(2)
         db = load_db()
         existing_ids  = {p["id"]  for p in db["peers"]}
         existing_ips  = {p["ip"]  for p in db["peers"]}
@@ -412,6 +456,63 @@ def restore():
         return jsonify({"ok": True, "added": added, "skipped": skipped})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/server/keys", methods=["POST"])
+def regenerate_keys():
+    """ساخت کلید جدید سرور + آپدیت wg0.conf — برای مواقعی که کلید گم شده"""
+    try:
+        priv = subprocess.check_output(["wg","genkey"]).decode().strip()
+        pub  = subprocess.check_output(["wg","pubkey"],input=priv.encode()).decode().strip()
+        with open("/etc/wireguard/server_private.key","w") as f: f.write(priv+"
+")
+        with open("/etc/wireguard/server_public.key","w") as f:  f.write(pub+"
+")
+        import stat
+        os.chmod("/etc/wireguard/server_private.key", stat.S_IRUSR|stat.S_IWUSR)
+        # آپدیت wg0.conf
+        with open("/etc/wireguard/wg0.conf","r") as f: conf=f.read()
+        import re
+        conf=re.sub(r"PrivateKey\s*=\s*\S+", f"PrivateKey = {priv}", conf)
+        with open("/etc/wireguard/wg0.conf","w") as f: f.write(conf)
+        # ری‌استارت WireGuard
+        subprocess.run(["systemctl","restart","wg-quick@wg0"],check=False)
+        return jsonify({"ok":True,"pubkey":pub,"message":"کلید جدید ساخته شد — کاربران باید کانفیگ جدید دریافت کنند"})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+@app.route("/api/server/export-key", methods=["GET"])
+def export_server_key():
+    """export کلید سرور برای بکاپ"""
+    try:
+        priv=open("/etc/wireguard/server_private.key").read().strip()
+        pub =open("/etc/wireguard/server_public.key").read().strip()
+        return jsonify({"privateKey":priv,"publicKey":pub})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+@app.route("/api/server/import-key", methods=["POST"])
+def import_server_key():
+    """import کلید قدیمی سرور — کاربران بدون کانفیگ جدید وصل میشن"""
+    try:
+        data=request.json or {}
+        priv=data.get("privateKey","").strip()
+        if len(priv) != 44:
+            return jsonify({"error":"کلید نامعتبر — باید ۴۴ کاراکتر باشد"}), 400
+        pub=subprocess.check_output(["wg","pubkey"],input=priv.encode()).decode().strip()
+        with open("/etc/wireguard/server_private.key","w") as f: f.write(priv+"
+")
+        with open("/etc/wireguard/server_public.key","w") as f:  f.write(pub+"
+")
+        import stat
+        os.chmod("/etc/wireguard/server_private.key", stat.S_IRUSR|stat.S_IWUSR)
+        with open("/etc/wireguard/wg0.conf","r") as f: conf=f.read()
+        import re
+        conf=re.sub(r"PrivateKey\s*=\s*\S+", f"PrivateKey = {priv}", conf)
+        with open("/etc/wireguard/wg0.conf","w") as f: f.write(conf)
+        subprocess.run(["systemctl","restart","wg-quick@wg0"],check=False)
+        return jsonify({"ok":True,"pubkey":pub})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
 
 # ─── Priority / QoS ──────────────────────────────────
 PRIORITY_CLASSES = {
@@ -486,58 +587,95 @@ def set_priority(pid):
 def get_qos():
     return jsonify(PRIORITY_CLASSES)
 
-# ─── Ping / Latency Monitor ──────────────────────────
-PING_HISTORY = {}   # {peer_ip: [(timestamp_ms, rtt_ms), ...]}  آخرین ۶۰ نقطه
-MAX_PING_HISTORY = 60
+# ─── Real-time WireGuard Stats Monitor ───────────────
+CONN_HISTORY = {}   # {pubkey: [snap, ...]}
+MAX_HISTORY  = 120
+_prev_bytes  = {}   # {pubkey: (rx, tx)}
 
-def ping_peer(ip):
-    """پینگ یک peer و برگرداندن RTT به ms"""
+def wg_full_dump():
+    """خواندن همه آمار peers با یک دستور wg show dump"""
+    result = {}
     try:
         out = subprocess.check_output(
-            ["ping","-c","3","-W","2","-q", ip],
-            stderr=subprocess.DEVNULL, timeout=10
-        ).decode()
-        # خط: rtt min/avg/max/mdev = 1.234/2.345/3.456/0.500 ms
-        for line in out.splitlines():
-            if "rtt" in line or "round-trip" in line:
-                parts = line.split("=")[-1].strip().split("/")
-                return round(float(parts[1]), 2)   # avg
-    except:
-        pass
-    return None
+            ["wg", "show", "wg0", "dump"],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        for line in out.splitlines()[1:]:   # خط اول = سرور
+            parts = line.split("\t")
+            if len(parts) < 7:
+                continue
+            pub      = parts[0]
+            endpoint = parts[2] if parts[2] != "(none)" else None
+            last_hs  = int(parts[4])
+            rx       = int(parts[5])
+            tx       = int(parts[6])
+            result[pub] = {"endpoint": endpoint, "last_hs": last_hs, "rx": rx, "tx": tx}
+    except Exception as e:
+        print(f"[wg dump] {e}")
+    return result
+
+def make_snap(pub, w, now_ms, now_s):
+    last_hs  = w.get("last_hs", 0)
+    rx       = w.get("rx", 0)
+    tx       = w.get("tx", 0)
+    prev_rx, prev_tx = _prev_bytes.get(pub, (rx, tx))
+    rx_kbps  = round(max(0, rx - prev_rx) * 8 / 30 / 1000, 1)
+    tx_kbps  = round(max(0, tx - prev_tx) * 8 / 30 / 1000, 1)
+    _prev_bytes[pub] = (rx, tx)
+    hs_age   = (now_s - last_hs) if last_hs > 0 else None
+    online   = hs_age is not None and hs_age < 180
+    if   not online or hs_age is None: quality = "offline"
+    elif hs_age < 30:                  quality = "excellent"
+    elif hs_age < 60:                  quality = "good"
+    elif hs_age < 120:                 quality = "fair"
+    else:                              quality = "poor"
+    return {
+        "t": now_ms, "online": online, "hs_age": hs_age,
+        "rx": rx, "tx": tx, "rx_kbps": rx_kbps, "tx_kbps": tx_kbps,
+        "quality": quality, "endpoint": w.get("endpoint"),
+    }
 
 def bg_ping_monitor():
-    """پینگ همه peers فعال هر ۳۰ ثانیه"""
+    time.sleep(2)
     while True:
         try:
             db     = load_db()
-            active = wg_active_peers()
-            now    = int(time.time() * 1000)
-            for p in db["peers"]:
-                if p["pubkey"] not in active:
-                    continue
-                rtt = ping_peer(p["ip"])
-                ip  = p["ip"]
-                if ip not in PING_HISTORY:
-                    PING_HISTORY[ip] = []
-                PING_HISTORY[ip].append({"t": now, "rtt": rtt})
-                # نگه داشتن فقط آخرین MAX نقطه
-                if len(PING_HISTORY[ip]) > MAX_PING_HISTORY:
-                    PING_HISTORY[ip] = PING_HISTORY[ip][-MAX_PING_HISTORY:]
+            now_ms = int(time.time() * 1000)
+            now_s  = int(time.time())
+            dump   = wg_full_dump()
+            for p in db.get("peers", []):
+                pub  = p["pubkey"]
+                snap = make_snap(pub, dump.get(pub, {}), now_ms, now_s)
+                if pub not in CONN_HISTORY:
+                    CONN_HISTORY[pub] = []
+                CONN_HISTORY[pub].append(snap)
+                if len(CONN_HISTORY[pub]) > MAX_HISTORY:
+                    CONN_HISTORY[pub] = CONN_HISTORY[pub][-MAX_HISTORY:]
         except Exception as e:
-            print(f"ping monitor error: {e}")
+            print(f"[monitor] {e}")
         time.sleep(30)
 
 @app.route("/api/ping", methods=["GET"])
 def get_ping():
-    """برگرداندن تاریخچه پینگ همه peers"""
-    return jsonify(PING_HISTORY)
+    db = load_db()
+    return jsonify({p["ip"]: CONN_HISTORY.get(p["pubkey"], []) for p in db.get("peers", [])})
 
-@app.route("/api/ping/<ip>", methods=["GET"])
-def get_peer_ping(ip):
-    """تاریخچه پینگ یک peer خاص"""
-    clean_ip = ip.replace("-",".")   # support 10-8-0-2 format
-    return jsonify(PING_HISTORY.get(clean_ip, []))
+@app.route("/api/ping/<peer_ip>", methods=["GET"])
+def get_peer_ping(peer_ip):
+    clean_ip = peer_ip.replace("-", ".")
+    db   = load_db()
+    peer = next((p for p in db.get("peers", []) if p["ip"] == clean_ip), None)
+    if not peer:
+        return jsonify([])
+    history = CONN_HISTORY.get(peer["pubkey"], [])
+    if not history:
+        # snapshot لحظه‌ای اگه هنوز داده جمع نشده
+        dump = wg_full_dump()
+        snap = make_snap(peer["pubkey"], dump.get(peer["pubkey"], {}),
+                         int(time.time()*1000), int(time.time()))
+        history = [snap]
+    return jsonify(history)
+    return jsonify(CONN_HISTORY.get(peer["pubkey"], []))
 
 if __name__ == "__main__":
     t1 = threading.Thread(target=bg_checker, daemon=True)
@@ -849,114 +987,114 @@ function PriorityModal({peer,onClose,onSave}){
   </ModalWrap>);
 }
 
-// ── Ping Chart Modal ──────────────────────────────────
-function PingModal({peer,onClose}){
-  const [data,setData]=useState([]);
-  const [loading,setLoading]=useState(true);
-  const [liveRtt,setLiveRtt]=useState(null);
+// ── Ping / Stats Modal ───────────────────────────────
+const QUALITY_CFG={
+  excellent:{label:"عالی",   color:"#00e676",icon:"🟢",desc:"اتصال کاملاً پایدار"},
+  good:     {label:"خوب",    color:"#69f0ae",icon:"🟢",desc:"اتصال پایدار"},
+  fair:     {label:"متوسط",  color:"#ff9100",icon:"🟡",desc:"تأخیر متوسط"},
+  poor:     {label:"ضعیف",   color:"#ff5252",icon:"🔴",desc:"تأخیر بالا"},
+  offline:  {label:"آفلاین", color:"#6b7fa3",icon:"⚫",desc:"متصل نیست"},
+};
 
-  const fetchPing=useCallback(async()=>{
+function PingModal({peer,onClose}){
+  const [snaps,setSnaps]=useState([]);
+  const [loading,setLoading]=useState(true);
+
+  const load=useCallback(async()=>{
     try{
       const r=await fetch(`${API}/ping/${peer.ip.replace(/\./g,"-")}`);
-      if(r.ok){
-        const d=await r.json();
-        const points=d.map((p,i)=>({
-          i:i+1,
-          t:new Date(p.t).toLocaleTimeString("fa-IR",{hour:"2-digit",minute:"2-digit"}),
-          rtt:p.rtt,
-        }));
-        setData(points);
-        if(points.length>0){
-          const last=points[points.length-1];
-          setLiveRtt(last.rtt);
-        }
-      }
+      if(r.ok){const d=await r.json();setSnaps(Array.isArray(d)?d:[]);}
     }catch{}
     setLoading(false);
   },[peer.ip]);
 
-  useEffect(()=>{
-    fetchPing();
-    const t=setInterval(fetchPing,15000);
-    return()=>clearInterval(t);
-  },[fetchPing]);
+  useEffect(()=>{load();const t=setInterval(load,15000);return()=>clearInterval(t);},[load]);
 
-  const validData=data.filter(d=>d.rtt!==null);
-  const avgRtt=validData.length>0?Math.round(validData.reduce((s,d)=>s+d.rtt,0)/validData.length):null;
-  const minRtt=validData.length>0?Math.min(...validData.map(d=>d.rtt)):null;
-  const maxRtt=validData.length>0?Math.max(...validData.map(d=>d.rtt)):null;
-  const lossCount=data.filter(d=>d.rtt===null).length;
-  const lossPct=data.length>0?Math.round((lossCount/data.length)*100):0;
+  const last  = snaps.length>0?snaps[snaps.length-1]:null;
+  const qcfg  = QUALITY_CFG[last?.quality||"offline"];
+  const online= last?.online||false;
+  const onSn  = snaps.filter(s=>s.online);
+  const uptime= snaps.length>0?Math.round((onSn.length/snaps.length)*100):0;
+  const avgRx = onSn.length>0?Math.round(onSn.reduce((s,x)=>s+(x.rx_kbps||0),0)/onSn.length):0;
+  const avgTx = onSn.length>0?Math.round(onSn.reduce((s,x)=>s+(x.tx_kbps||0),0)/onSn.length):0;
 
-  const rttColor=(rtt)=>rtt===null?C.red:rtt<50?C.green:rtt<150?C.orange:C.red;
+  const fmtB=(b)=>{if(!b)return"0 B";if(b>=1e9)return(b/1e9).toFixed(2)+" GB";if(b>=1e6)return(b/1e6).toFixed(2)+" MB";return(b/1e3).toFixed(1)+" KB";};
+  const fmtAge=(s)=>{if(!s&&s!==0)return"هرگز";if(s<60)return`${s}ث پیش`;if(s<3600)return`${Math.floor(s/60)}د پیش`;return`${Math.floor(s/3600)}س پیش`;};
+
+  const chart=snaps.map((s,i)=>({
+    t:new Date(s.t).toLocaleTimeString("fa-IR",{hour:"2-digit",minute:"2-digit"}),
+    rx:s.rx_kbps||0, tx:s.tx_kbps||0,
+  }));
 
   return(<ModalWrap onClose={onClose} width={580}>
-    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
       <div>
-        <div style={{fontSize:12,color:C.textMuted}}>نمودار پینگ</div>
-        <div style={{fontSize:18,fontWeight:700,color:C.text}}>{peer.name} — {peer.ip}</div>
+        <div style={{fontSize:12,color:C.textMuted}}>آمار اتصال WireGuard</div>
+        <div style={{fontSize:18,fontWeight:700,color:C.text}}>{peer.name}</div>
+        <div style={{fontSize:11,color:C.textMuted,fontFamily:"monospace"}}>{peer.ip}</div>
       </div>
-      <button onClick={onClose} style={{background:"transparent",border:`1px solid ${C.border}`,color:C.textMuted,borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:16}}>✕</button>
+      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        <div style={{padding:"8px 14px",borderRadius:10,background:qcfg.color+"22",border:`1px solid ${qcfg.color}44`,textAlign:"center"}}>
+          <div style={{fontSize:18}}>{qcfg.icon}</div>
+          <div style={{fontSize:11,color:qcfg.color,fontWeight:700}}>{qcfg.label}</div>
+        </div>
+        <button onClick={onClose} style={{background:"transparent",border:`1px solid ${C.border}`,color:C.textMuted,borderRadius:8,width:32,height:32,cursor:"pointer",fontSize:16}}>✕</button>
+      </div>
     </div>
 
-    {/* Live RTT */}
-    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:20}}>
+    {/* آمار */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:14}}>
       {[
-        {label:"RTT فعلی",value:liveRtt!=null?`${liveRtt} ms`:"—",color:liveRtt!=null?rttColor(liveRtt):C.textMuted},
-        {label:"میانگین",value:avgRtt!=null?`${avgRtt} ms`:"—",color:avgRtt!=null?rttColor(avgRtt):C.textMuted},
-        {label:"کمترین",value:minRtt!=null?`${minRtt} ms`:"—",color:C.green},
-        {label:"packet loss",value:`${lossPct}%`,color:lossPct>5?C.red:lossPct>0?C.orange:C.green},
-      ].map(({label,value,color})=>(
-        <div key={label} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px",textAlign:"center"}}>
-          <div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>{label}</div>
-          <div style={{fontSize:20,fontWeight:800,color,fontFamily:"monospace"}}>{value}</div>
+        {l:"handshake",v:last?.hs_age!=null?fmtAge(last.hs_age):"—",c:online?C.green:C.textMuted},
+        {l:"آپتایم",v:snaps.length>0?`${uptime}%`:"—",c:uptime>90?C.green:uptime>50?C.orange:C.red},
+        {l:"دانلود میانگین",v:avgRx>0?`${avgRx}k`:"—",c:C.cyan},
+        {l:"آپلود میانگین",v:avgTx>0?`${avgTx}k`:"—",c:C.purple},
+      ].map(({l,v,c})=>(
+        <div key={l} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 8px",textAlign:"center"}}>
+          <div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>{l}</div>
+          <div style={{fontSize:16,fontWeight:800,color:c,fontFamily:"monospace"}}>{v}</div>
         </div>
       ))}
     </div>
 
-    {/* Chart */}
+    {/* endpoint + ترافیک کل */}
+    {last&&(
+      <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 14px",marginBottom:14,display:"flex",gap:16,flexWrap:"wrap",fontSize:11}}>
+        <div><span style={{color:C.textMuted}}>Endpoint: </span><span style={{fontFamily:"monospace",color:C.text}}>{last.endpoint||"نامشخص"}</span></div>
+        <div><span style={{color:C.textMuted}}>↓ کل: </span><span style={{color:C.cyan}}>{fmtB(last.rx)}</span></div>
+        <div><span style={{color:C.textMuted}}>↑ کل: </span><span style={{color:C.purple}}>{fmtB(last.tx)}</span></div>
+      </div>
+    )}
+
+    {/* نمودار */}
     {loading?(
-      <div style={{height:200,display:"flex",alignItems:"center",justifyContent:"center",color:C.textMuted}}>⏳ در حال بارگذاری...</div>
-    ):data.length===0?(
-      <div style={{height:200,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",color:C.textMuted,gap:8}}>
-        <div style={{fontSize:32}}>📡</div>
-        <div style={{fontSize:13}}>داده‌ای موجود نیست</div>
-        <div style={{fontSize:11}}>کاربر باید آنلاین باشد — هر ۳۰ ثانیه یکبار اندازه‌گیری میشه</div>
+      <div style={{height:160,display:"flex",alignItems:"center",justifyContent:"center",color:C.textMuted}}>⏳ بارگذاری...</div>
+    ):chart.length<=1?(
+      <div style={{height:160,background:C.bg,borderRadius:10,border:`1px solid ${C.border}`,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:6,color:C.textMuted}}>
+        <div style={{fontSize:28}}>📡</div>
+        <div style={{fontSize:13,fontWeight:600}}>در حال جمع‌آوری داده...</div>
+        <div style={{fontSize:11}}>هر ۳۰ ثانیه یک نقطه — کمی صبر کنید</div>
+        {last&&<div style={{fontSize:11,color:qcfg.color,marginTop:4}}>{qcfg.icon} {qcfg.desc}</div>}
       </div>
     ):(
-      <ResponsiveContainer width="100%" height={200}>
-        <AreaChart data={data} margin={{top:5,right:5,left:0,bottom:5}}>
-          <defs>
-            <linearGradient id="rttGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%"  stopColor={C.cyan} stopOpacity={0.4}/>
-              <stop offset="95%" stopColor={C.cyan} stopOpacity={0}/>
-            </linearGradient>
-          </defs>
-          <XAxis dataKey="t" tick={{fill:C.textDim,fontSize:9}} axisLine={false} tickLine={false} interval="preserveStartEnd"/>
-          <YAxis tick={{fill:C.textDim,fontSize:9}} axisLine={false} tickLine={false} unit="ms"/>
-          <Tooltip
-            contentStyle={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,color:C.text,fontSize:12}}
-            formatter={(v)=>v!=null?[`${v} ms`,"RTT"]:["timeout","RTT"]}
-          />
-          <Area type="monotone" dataKey="rtt" stroke={C.cyan} fill="url(#rttGrad)" strokeWidth={2} connectNulls={false} dot={(props)=>{
-            const {cx,cy,payload}=props;
-            if(payload.rtt===null)return<circle key={props.key} cx={cx} cy={cy||10} r={4} fill={C.red}/>;
-            return<circle key={props.key} cx={cx} cy={cy} r={2} fill={C.cyan}/>;
-          }}/>
-        </AreaChart>
-      </ResponsiveContainer>
-    )}
-
-    {/* کیفیت اتصال */}
-    {avgRtt!=null&&(
-      <div style={{marginTop:16,padding:"10px 14px",borderRadius:10,background:rttColor(avgRtt)+"11",border:`1px solid ${rttColor(avgRtt)}44`,fontSize:12,color:rttColor(avgRtt),textAlign:"center",fontWeight:600}}>
-        {avgRtt<50?"🟢 کیفیت عالی":avgRtt<150?"🟡 کیفیت متوسط":"🔴 کیفیت ضعیف"}
-        {" — "}
-        {avgRtt<50?"اتصال پایدار و سریع":avgRtt<150?"قابل قبول برای استفاده معمولی":"تأخیر بالا — بررسی شبکه توصیه میشه"}
+      <div>
+        <div style={{fontSize:11,color:C.textMuted,marginBottom:6}}>نرخ ترافیک kbps — {chart.length} نقطه</div>
+        <ResponsiveContainer width="100%" height={160}>
+          <AreaChart data={chart} margin={{top:4,right:4,left:0,bottom:4}}>
+            <defs>
+              <linearGradient id="rxG" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.cyan} stopOpacity={0.4}/><stop offset="95%" stopColor={C.cyan} stopOpacity={0}/></linearGradient>
+              <linearGradient id="txG" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.purple} stopOpacity={0.4}/><stop offset="95%" stopColor={C.purple} stopOpacity={0}/></linearGradient>
+            </defs>
+            <XAxis dataKey="t" tick={{fill:C.textDim,fontSize:9}} axisLine={false} tickLine={false} interval="preserveStartEnd"/>
+            <YAxis tick={{fill:C.textDim,fontSize:9}} axisLine={false} tickLine={false} unit="k"/>
+            <Tooltip contentStyle={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,color:C.text,fontSize:11}} formatter={(v,n)=>[`${v} kbps`,n==="rx"?"↓ دانلود":"↑ آپلود"]}/>
+            <Area type="monotone" dataKey="rx" stroke={C.cyan}   fill="url(#rxG)" strokeWidth={2} name="rx"/>
+            <Area type="monotone" dataKey="tx" stroke={C.purple} fill="url(#txG)" strokeWidth={2} name="tx"/>
+          </AreaChart>
+        </ResponsiveContainer>
       </div>
     )}
-
-    <div style={{marginTop:10,fontSize:10,color:C.textDim,textAlign:"center"}}>اندازه‌گیری هر ۳۰ ثانیه — آخرین {data.length} نقطه نمایش داده میشه</div>
+    <div style={{marginTop:8,fontSize:10,color:C.textDim,textAlign:"center"}}>داده از wg dump — بدون ping — هر ۳۰ ثانیه</div>
   </ModalWrap>);
 }
 
@@ -1076,7 +1214,7 @@ function AddUserModal({onClose,onAdd}){
 // ── Config Modal ──────────────────────────────────────
 function ConfigModal({peer,serverInfo,onClose}){
   const [tab,setTab]=useState("qr");
-  const cfg=`[Interface]\nPrivateKey = ${peer.privkey}\nAddress = ${peer.ip}/24\nDNS = 1.1.1.1, 8.8.8.8\n\n[Peer]\nPublicKey = ${serverInfo?.pubkey||""}\nEndpoint = ${serverInfo?.ip||""}:${serverInfo?.port||51820}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25`;
+  const cfg=`[Interface]\nPrivateKey = ${peer.privkey}\nAddress = ${peer.ip}/24\nDNS = 1.1.1.1, 8.8.8.8\nMTU = 1420\n\n[Peer]\nPublicKey = ${serverInfo?.pubkey||""}\nEndpoint = ${serverInfo?.ip||""}:${serverInfo?.port||51820}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 15`;
   const dl=()=>{const b=new Blob([cfg],{type:"text/plain"});const u=URL.createObjectURL(b);const a=document.createElement("a");a.href=u;a.download=`${peer.name.replace(/\s+/g,"-")}-wg.conf`;a.click();URL.revokeObjectURL(u);};
   return(<ModalWrap onClose={onClose}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
@@ -1109,6 +1247,7 @@ function ConfigModal({peer,serverInfo,onClose}){
 function BackupModal({onClose,showToast,onRestore}){
   const [tab,setTab]=useState("backup");
   const [restoreMode,setRestoreMode]=useState("merge");
+  const [restoreServerKey,setRestoreServerKey]=useState(true);
   const [file,setFile]=useState(null);
   const [fileData,setFileData]=useState(null);
   const [loading,setLoading]=useState(false);
@@ -1146,7 +1285,7 @@ function BackupModal({onClose,showToast,onRestore}){
     if(!fileData?.peers){showToast("فایل بکاپ معتبر نیست",C.red);return;}
     setLoading(true);
     try{
-      const r=await fetch(`${API}/restore`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({peers:fileData.peers,mode:restoreMode})});
+      const r=await fetch(`${API}/restore`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({peers:fileData.peers,mode:restoreMode,restoreServerKey,serverPriv:fileData.serverPriv||null})});
       const d=await r.json();
       if(r.ok){
         showToast(`✓ ${d.added} کاربر بازیابی شد${d.skipped>0?` (${d.skipped} رد شد)`:""}`);
@@ -1234,6 +1373,26 @@ function BackupModal({onClose,showToast,onRestore}){
           </div>
         )}
 
+        {/* گزینه restore کلید سرور */}
+        {preview&&fileData?.serverPriv&&(
+          <div style={{background:C.orange+"11",border:`1px solid ${C.orange}44`,borderRadius:10,padding:"12px 14px"}}>
+            <label style={{display:"flex",alignItems:"flex-start",gap:10,cursor:"pointer"}}>
+              <input type="checkbox" checked={restoreServerKey} onChange={e=>setRestoreServerKey(e.target.checked)}
+                style={{marginTop:2,accentColor:C.orange,width:16,height:16,flexShrink:0}}/>
+              <div>
+                <div style={{fontSize:13,color:C.orange,fontWeight:700}}>🔑 بازیابی کلید سرور</div>
+                <div style={{fontSize:11,color:C.textMuted,marginTop:3,lineHeight:1.5}}>
+                  کاربران با همان کانفیگ قدیمی وصل میشن — بدون نیاز به کانفیگ جدید
+                </div>
+              </div>
+            </label>
+          </div>
+        )}
+        {preview&&!fileData?.serverPriv&&(
+          <div style={{background:C.red+"11",border:`1px solid ${C.red}33`,borderRadius:8,padding:"10px 14px",fontSize:11,color:C.textMuted}}>
+            ⚠️ این بکاپ کلید سرور ندارد — کاربران باید کانفیگ جدید دریافت کنند
+          </div>
+        )}
         <div style={{display:"flex",gap:10,marginTop:4}}>
           <button onClick={onClose} style={{flex:1,padding:"11px 0",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>انصراف</button>
           <button onClick={doRestore} disabled={!file||loading} style={{flex:2,padding:"11px 0",borderRadius:8,border:"none",background:file?C.cyan:"#333",color:file?C.bg:C.textDim,cursor:file&&!loading?"pointer":"not-allowed",fontSize:14,fontWeight:700,fontFamily:"inherit",opacity:loading?0.7:1}}>
