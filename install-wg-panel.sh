@@ -847,9 +847,17 @@ systemctl is-active --quiet wg-api && ok "API فعال (port 5000)" || { warn "A
 
 step "آماده‌سازی React..."
 mkdir -p /opt/wg-panel && cd /opt/wg-panel
-if [[ ! -f package.json ]]; then
-  npx --yes create-react-app . --template cra-template 2>&1 | tail -5
+set -o pipefail
+if [[ ! -f package.json ]] || [[ ! -d node_modules ]] || [[ ! -d src ]]; then
+  warn "پروژه React کامل نیست — بازسازی می‌شود..."
+  rm -rf node_modules package.json package-lock.json src public 2>/dev/null || true
+  npx --yes create-react-app . --template cra-template 2>&1 | tee -a "$LOG_FILE" | tail -5
+  if [[ ! -f package.json ]]; then
+    die "ساخت پروژه React ناموفق بود — جزئیات: $LOG_FILE"
+  fi
 fi
+set +o pipefail
+mkdir -p src   # تضمین وجود پوشه src صرف‌نظر از وضعیت قبلی
 npm install --save recharts qrcode.react 2>&1 | tail -3
 ok "npm packages آماده"
 rm -f src/App.js src/App.css src/App.test.js src/logo.svg src/reportWebVitals.js src/setupTests.js
