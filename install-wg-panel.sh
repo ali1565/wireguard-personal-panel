@@ -1,26 +1,5 @@
 #!/bin/bash
 set -e
-
-# ══════════════════════════════════════════════════════
-# اگر اسکریپت مستقیم از curl | bash اجرا شده باشد، stdin
-# با جریان دانلود اشتراکی است و دستوراتی مثل apt/whiptail
-# که از stdin می‌خوانند باعث خطای "curl: (23) failure
-# writing output to destination" می‌شوند. راه‌حل: کل
-# اسکریپت را در یک فایل موقت ذخیره کرده و جدا اجرا می‌کنیم
-# تا stdin آزاد و پایدار باشد.
-# ══════════════════════════════════════════════════════
-if [ ! -t 0 ] && [ -z "$WG_INSTALLER_REEXEC" ]; then
-  TMP_SCRIPT="/tmp/wg-panel-installer-$$.sh"
-  cat > "$TMP_SCRIPT"
-  chmod +x "$TMP_SCRIPT"
-  export WG_INSTALLER_REEXEC=1
-  if [ -r /dev/tty ]; then
-    exec bash "$TMP_SCRIPT" "$@" < /dev/tty
-  else
-    exec bash "$TMP_SCRIPT" "$@" < /dev/null
-  fi
-fi
-
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export NEEDRESTART_SUSPEND=1
@@ -70,7 +49,21 @@ if ! command -v whiptail &>/dev/null; then
   apt-get install -y -qq whiptail >/dev/null 2>&1 || true
 fi
 
-if command -v whiptail &>/dev/null && [ -t 1 ]; then
+# پیش‌آزمون پایداری whiptail — روی برخی سرورهای مجازی‌سازی‌شده
+# (OpenVZ/LXC با ncurses ناقص) whiptail کرش می‌کند. اگر کرش کرد،
+# خودکار به حالت متنی ساده برمی‌گردیم بدون توقف نصب.
+WHIPTAIL_SAFE=0
+if command -v whiptail &>/dev/null && [ -t 1 ] && [ -t 0 ]; then
+  set +e
+  timeout 3 whiptail --gauge "test" 6 40 0 < /dev/null > /dev/null 2>&1
+  WT_TEST_STATUS=$?
+  set -e
+  if [ $WT_TEST_STATUS -lt 128 ]; then
+    WHIPTAIL_SAFE=1
+  fi
+fi
+
+if [ $WHIPTAIL_SAFE -eq 1 ]; then
   GAUGE_MODE=1
   GAUGE_FIFO=$(mktemp -u /tmp/wg-gauge.XXXXXX)
   mkfifo "$GAUGE_FIFO"
@@ -84,6 +77,8 @@ if command -v whiptail &>/dev/null && [ -t 1 ]; then
   exec 3>&1 4>&2
   exec 1>>"$LOG_FILE" 2>&1
   echo "IP سرور: $SERVER_IP" >&2
+else
+  echo -e "${YELLOW}[!]${NC} رابط گرافیکی روی این سرور پشتیبانی نمی‌شود — حالت متنی ساده استفاده می‌شود"
 fi
 
 step() {
