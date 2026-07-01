@@ -1,6 +1,29 @@
 #!/bin/bash
 set -e
+
+# ══════════════════════════════════════════════════════
+# اگر اسکریپت مستقیم از curl | bash اجرا شده باشد، stdin
+# با جریان دانلود اشتراکی است و دستوراتی مثل apt/whiptail
+# که از stdin می‌خوانند باعث خطای "curl: (23) failure
+# writing output to destination" می‌شوند. راه‌حل: کل
+# اسکریپت را در یک فایل موقت ذخیره کرده و جدا اجرا می‌کنیم
+# تا stdin آزاد و پایدار باشد.
+# ══════════════════════════════════════════════════════
+if [ ! -t 0 ] && [ -z "$WG_INSTALLER_REEXEC" ]; then
+  TMP_SCRIPT="/tmp/wg-panel-installer-$$.sh"
+  cat > "$TMP_SCRIPT"
+  chmod +x "$TMP_SCRIPT"
+  export WG_INSTALLER_REEXEC=1
+  if [ -r /dev/tty ]; then
+    exec bash "$TMP_SCRIPT" "$@" < /dev/tty
+  else
+    exec bash "$TMP_SCRIPT" "$@" < /dev/null
+  fi
+fi
+
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
 
 GREEN='\033[0;32m'; CYAN='\033[0;36m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info()  { echo -e "${CYAN}[*]${NC} $1"; }
