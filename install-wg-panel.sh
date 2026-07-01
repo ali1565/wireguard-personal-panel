@@ -1673,7 +1673,7 @@ function EditModal({peer,onClose,onSave}){
 
 // ── Main ──────────────────────────────────────────────
 export default function App(){
-  const [loggedIn,setLoggedIn]=useState(false);
+  const [loggedIn,setLoggedIn]=useState(true);
   const [peers,setPeers]=useState([]);
   const [serverInfo,setServerInfo]=useState(null);
   const [history]=useState(genHistory());
@@ -1724,7 +1724,6 @@ export default function App(){
   const totalMax=peers.reduce((s,p)=>s+(p.maxBytes||0),0);
   const pieData=peers.map(p=>({name:p.name,value:p.usedBytes||1}));
 
-  if(!loggedIn)return <LoginPage onLogin={()=>setLoggedIn(true)}/>;
 
   return(
     <div key={theme} dir="rtl" style={{minHeight:"100vh",background:C.bg,color:C.text,fontFamily:"'Vazirmatn','Segoe UI',sans-serif",paddingBottom:40}}>
@@ -1745,8 +1744,6 @@ export default function App(){
             {THEMES[theme]?.icon} تم
           </button>
           <button onClick={()=>setBackupModal(true)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>💾 بکاپ</button>
-          <button onClick={()=>setChangingPass(true)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>🔑 رمز</button>
-          <button onClick={()=>setLoggedIn(false)} style={{padding:"8px 12px",borderRadius:8,border:`1px solid ${C.border}`,background:"transparent",color:C.textMuted,cursor:"pointer",fontSize:13,fontFamily:"inherit"}}>خروج</button>
         </div>
       </div>
 
@@ -1909,7 +1906,6 @@ export default function App(){
       {domainModal&&<DomainModal serverInfo={serverInfo} onClose={()=>setDomainModal(false)} showToast={showToast} onUpdate={(d)=>setServerInfo(s=>({...s,domain:d,endpoint_host:d||s?.ip}))}/>}
       {themeModal&&<ThemeModal onClose={()=>setThemeModal(false)} currentTheme={theme} onThemeChange={applyTheme}/>}
       {backupModal&&<BackupModal onClose={()=>setBackupModal(false)} showToast={showToast} onRestore={fetchPeers}/>}
-      {changingPass&&<ChangePassModal onClose={()=>setChangingPass(false)} showToast={showToast}/>}
       {toast&&<div style={{position:"fixed",bottom:28,left:"50%",transform:"translateX(-50%)",background:toast.color,color:C.bg,padding:"10px 24px",borderRadius:99,fontWeight:700,fontSize:13,zIndex:500,boxShadow:"0 4px 20px #0006"}}>{toast.msg}</div>}
     </div>
   );
@@ -1957,7 +1953,7 @@ else
   echo "$PANEL_PORT" > "$PANEL_PORT_FILE"
 fi
 
-# ── Basic Auth برای لایه دوم امنیت ─────────────────
+# ── Basic Auth — تنها لایه احراز هویت ──────────────
 apt-get install -y -qq apache2-utils 2>&1 | tail -2
 HTPASSWD_FILE="/etc/nginx/.wg-htpasswd"
 BASIC_AUTH_PASS_FILE="/opt/wg-api/basic_auth_pass.txt"
@@ -2022,12 +2018,11 @@ echo -e "${YELLOW}  🔒 پنل مدیریت (مخفی‌شده):${NC}"
 echo -e "  ${CYAN}http://${SERVER_IP}:${PANEL_PORT}/${PANEL_PATH}/${NC}"
 echo -e "  این آدرس رو جایی ذخیره کن — به جز این مسیر، هیچ مسیر دیگه‌ای کار نمی‌کنه"
 echo ""
-echo -e "${YELLOW}  🔑 لایه اول — احراز هویت Nginx:${NC}"
+echo -e "${YELLOW}  🔑 احراز هویت پنل (Basic Auth):${NC}"
 echo -e "  نام کاربری: ${CYAN}${BASIC_USER}${NC}"
 echo -e "  رمز عبور:   ${CYAN}${BASIC_PASS}${NC}"
 echo ""
-echo -e "${YELLOW}  🔑 لایه دوم — رمز ورود به پنل:${NC}"
-echo -e "  رمز پنل:    ${CYAN}admin123${NC}  (از داخل پنل قابل تغییر)"
+
 echo ""
 if [[ -f /opt/udp2raw/udp2raw ]]; then
 echo -e "${YELLOW}  🛡️  ضدفیلترینگ ترافیک (udp2raw):${NC}"
