@@ -4,36 +4,18 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export NEEDRESTART_SUSPEND=1
 
-GREEN='\033[0;32m'; CYAN='\033[0;36m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+GREEN='\033[0;32m'; CYAN='\033[0;36m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'; BOLD='\033[1m'
 info()  { echo -e "${CYAN}[*]${NC} $1"; }
 ok()    { echo -e "${GREEN}[✓]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 
 LOG_FILE="/var/log/wg-panel-install.log"
 : > "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/wg-panel-install.log"
-GAUGE_MODE=0
-GAUGE_DONE=0
-GAUGE_FIFO=""
-WHIPTAIL_PID=""
 TOTAL_STEPS=12
 CUR_STEP=0
 
-cleanup_gauge() {
-  if [[ $GAUGE_MODE -eq 1 && $GAUGE_DONE -ne 1 ]]; then
-    GAUGE_DONE=1
-    exec 9>&- 2>/dev/null || true
-    [[ -n "$WHIPTAIL_PID" ]] && kill "$WHIPTAIL_PID" 2>/dev/null || true
-    wait "$WHIPTAIL_PID" 2>/dev/null || true
-    exec 1>&3 2>&4 2>/dev/null || true
-    exec 3>&- 4>&- 2>/dev/null || true
-    rm -f "$GAUGE_FIFO" 2>/dev/null || true
-    clear 2>/dev/null || true
-  fi
-}
-trap cleanup_gauge EXIT
-
 die() {
-  cleanup_gauge
+  echo ""
   echo -e "${RED}[✗]${NC} $1"
   echo -e "${YELLOW}جزئیات خطا در: ${LOG_FILE}${NC}"
   exit 1
@@ -43,60 +25,23 @@ die() {
 
 SERVER_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 
-# ── راه‌اندازی Installer گرافیکی (whiptail) ──────────
-if ! command -v whiptail &>/dev/null; then
-  apt-get update -qq >/dev/null 2>&1
-  apt-get install -y -qq whiptail >/dev/null 2>&1 || true
-fi
-
-# پیش‌آزمون پایداری whiptail — روی برخی سرورهای مجازی‌سازی‌شده
-# (OpenVZ/LXC با ncurses ناقص) whiptail کرش می‌کند. اگر کرش کرد،
-# خودکار به حالت متنی ساده برمی‌گردیم بدون توقف نصب.
-WHIPTAIL_SAFE=0
-if command -v whiptail &>/dev/null && [ -t 1 ] && [ -t 0 ]; then
-  set +e
-  timeout 3 whiptail --gauge "test" 6 40 0 < /dev/null > /dev/null 2>&1
-  WT_TEST_STATUS=$?
-  set -e
-  if [ $WT_TEST_STATUS -lt 128 ]; then
-    WHIPTAIL_SAFE=1
-  fi
-fi
-
-if [ $WHIPTAIL_SAFE -eq 1 ]; then
-  GAUGE_MODE=1
-  GAUGE_FIFO=$(mktemp -u /tmp/wg-gauge.XXXXXX)
-  mkfifo "$GAUGE_FIFO"
-  (
-    whiptail --title " 🔒 نصب پنل مدیریت WireGuard " \
-      --backtitle "WireGuard Panel Installer" \
-      --gauge "در حال آماده‌سازی نصب..." 12 72 0 < "$GAUGE_FIFO"
-  ) &
-  WHIPTAIL_PID=$!
-  exec 9>"$GAUGE_FIFO"
-  exec 3>&1 4>&2
-  exec 1>>"$LOG_FILE" 2>&1
-  echo "IP سرور: $SERVER_IP" >&2
-else
-  echo -e "${YELLOW}[!]${NC} رابط گرافیکی روی این سرور پشتیبانی نمی‌شود — حالت متنی ساده استفاده می‌شود"
-fi
-
+# ── نوار پیشرفت متنی — بدون وابستگی به whiptail/ncurses ──
+# (پایدار روی همه محیط‌ها، ازجمله OpenVZ/LXC/کانتینرهای سبک)
 step() {
   CUR_STEP=$((CUR_STEP+1))
   local pct=$(( CUR_STEP * 100 / TOTAL_STEPS ))
   local msg="$1"
-  if [[ $GAUGE_MODE -eq 1 ]]; then
-    printf 'XXX\n%d\n\nمرحله %d از %d\n\n%s\n\nXXX\n' "$pct" "$CUR_STEP" "$TOTAL_STEPS" "$msg" >&9
-  fi
-  step "$msg"
+  local filled=$(( pct * 34 / 100 ))
+  local empty=$(( 34 - filled ))
+  local bar=""
+  for ((i=0;i<filled;i++)); do bar+="█"; done
+  for ((i=0;i<empty;i++)); do bar+="░"; done
+  printf "\r\033[K${CYAN}[%3d%%]${NC} ${bar} ${BOLD}%2d/%2d${NC}  %s\n" "$pct" "$CUR_STEP" "$TOTAL_STEPS" "$msg"
+  info "$msg" >> "$LOG_FILE" 2>&1 || true
 }
 
 finish_gauge() {
-  if [[ $GAUGE_MODE -eq 1 ]]; then
-    printf 'XXX\n100\n\n✅ نصب با موفقیت کامل شد!\n\nXXX\n' >&9
-    sleep 1
-  fi
-  cleanup_gauge
+  echo -e "${GREEN}[100%] ██████████████████████████████████  ✅ نصب کامل شد${NC}"
 }
 
 step "IP سرور شناسایی شد: $SERVER_IP"
