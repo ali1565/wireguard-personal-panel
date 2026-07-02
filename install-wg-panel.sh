@@ -197,6 +197,16 @@ import subprocess, json, os, time, threading
 app = Flask(__name__)
 CORS(app)
 
+@app.errorhandler(Exception)
+def handle_any_error(e):
+    """هر خطای مدیریت‌نشده را به JSON تبدیل می‌کند تا فرانت‌اند بتواند پیام واقعی را نشان دهد"""
+    import traceback
+    traceback.print_exc()
+    code = getattr(e, "code", 500)
+    if not isinstance(code, int):
+        code = 500
+    return jsonify({"error": f"خطای سرور: {str(e)[:300]}"}), code
+
 DB_FILE  = "/opt/wg-api/peers.json"
 CFG_FILE = "/opt/wg-api/config.json"
 WG_IF    = "wg0"
@@ -405,17 +415,21 @@ def get_peers():
 
 @app.route("/api/peers", methods=["POST"])
 def add_peer():
-    d         = request.json or {}
-    name      = d.get("name","").strip()
-    max_gb    = float(d.get("maxGB", 0))
-    speed_k   = int(d.get("speedKbps", 0))
-    expires_at = int(d.get("expiresAt", 0))   # timestamp ms, 0=بدون انقضا
+    d          = request.json or {}
+    name       = d.get("name","").strip()
+    max_gb     = float(d.get("maxGB", 0))
+    speed_k    = int(d.get("speedKbps", 0))
+    expires_at = int(d.get("expiresAt", 0))
 
     if not name: return jsonify({"error": "نام الزامی است"}), 400
     ip = next_ip()
     if not ip: return jsonify({"error": "ظرفیت IP تمام شده"}), 500
 
-    priv, pub = gen_keypair()
+    try:
+        priv, pub = gen_keypair()
+    except Exception as e:
+        return jsonify({"error": f"خطا در ساخت کلید WireGuard: {e}"}), 500
+
     peer = {
         "id":        f"p{int(time.time()*1000)}",
         "name":      name,
@@ -429,13 +443,28 @@ def add_peer():
         "expBlocked": False,
         "createdAt": int(time.time()*1000),
     }
+
     db = load_db()
     db["peers"].append(peer)
     save_db(db)
 
     if not is_expired(peer):
-        wg_add_peer(pub, ip)
-        if speed_k > 0: tc_apply(ip, speed_k)
+        try:
+            wg_add_peer(pub, ip)
+            if speed_k > 0:
+                tc_apply(ip, speed_k)
+        except subprocess.CalledProcessError as e:
+            # rollback: حذف از دیتابیس چون به wg اضافه نشد
+            db = load_db()
+            db["peers"] = [x for x in db["peers"] if x["id"] != peer["id"]]
+            save_db(db)
+            err_detail = (e.stderr.decode() if e.stderr else str(e))[:200]
+            return jsonify({"error": f"خطا در اضافه کردن به WireGuard: {err_detail}. بررسی کنید wg0 فعال است: systemctl status wg-quick@wg0"}), 500
+        except Exception as e:
+            db = load_db()
+            db["peers"] = [x for x in db["peers"] if x["id"] != peer["id"]]
+            save_db(db)
+            return jsonify({"error": f"خطای غیرمنتظره: {e}"}), 500
 
     return jsonify(peer), 201
 
@@ -867,7 +896,7 @@ import { useState, useEffect, useCallback } from "react";
 import { AreaChart,Area,XAxis,YAxis,Tooltip,ResponsiveContainer,PieChart,Pie,Cell } from "recharts";
 import { QRCodeSVG } from "qrcode.react";
 
-const API=`${window.location.protocol}//${window.location.hostname}/api`;
+const API=`${window.location.protocol}//${window.location.hostname}:${window.location.port}/api`;
 const PIE_COLORS=["#00d4ff","#7c3aed","#00e676","#ff9100","#ec4899","#f43f5e","#06b6d4","#84cc16"];
 
 // ── Themes ──────────────────────────────────────────
@@ -1984,24 +2013,31 @@ server {
     root /var/www/html;
     index index.html;
 
-    # لایه ۱: Basic Auth
-    auth_basic           "Restricted";
-    auth_basic_user_file ${HTPASSWD_FILE};
-
+    # مسیر API — بدون Basic Auth (React مستقیم صدا میزنه)
     location /api/ {
         proxy_pass         http://127.0.0.1:5000/api/;
         proxy_http_version 1.1;
         proxy_set_header   Host \$host;
         proxy_set_header   X-Real-IP \$remote_addr;
         proxy_read_timeout 60s;
+        # اجازه CORS برای درخواست‌های داخلی
+        add_header Access-Control-Allow-Origin "*";
+        add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS";
+        add_header Access-Control-Allow-Headers "Content-Type";
+        if (\$request_method = OPTIONS) {
+            return 204;
+        }
     }
 
-    # لایه ۲: مسیر مخفی تصادفی
+    # پنل مدیریت — با Basic Auth
     location /${PANEL_PATH}/ {
+        auth_basic           "WireGuard Panel";
+        auth_basic_user_file ${HTPASSWD_FILE};
         alias /var/www/html/;
         try_files \$uri \$uri/ /${PANEL_PATH}/index.html;
     }
 
+    # هر مسیر دیگه‌ای ممنوع
     location / { return 404; }
 }
 NGEOF
