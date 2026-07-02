@@ -11,7 +11,7 @@ warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 
 LOG_FILE="/var/log/wg-panel-install.log"
 : > "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/wg-panel-install.log"
-TOTAL_STEPS=12
+TOTAL_STEPS=13
 CUR_STEP=0
 
 die() {
@@ -79,6 +79,8 @@ SRV_PRIV=$(cat /etc/wireguard/server_private.key)
 SRV_PUB=$(cat /etc/wireguard/server_public.key)
 MAIN_IF=$(ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1)
 [[ -z "$MAIN_IF" ]] && MAIN_IF="eth0"
+ok "اینترفیس شبکه: $MAIN_IF"
+
 if [[ ! -f /etc/wireguard/wg0.conf ]]; then
 cat > /etc/wireguard/wg0.conf << WGEOF
 [Interface]
@@ -89,6 +91,11 @@ MTU = 1380
 PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${MAIN_IF} -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${MAIN_IF} -j MASQUERADE
 WGEOF
+else
+  # اگه wg0.conf از قبل وجود داشت، PostUp/PostDown رو با اینترفیس درست آپدیت کن
+  warn "wg0.conf موجود است — PostUp/PostDown با اینترفیس $MAIN_IF آپدیت می‌شود"
+  sed -i "s|PostUp.*|PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${MAIN_IF} -j MASQUERADE|" /etc/wireguard/wg0.conf
+  sed -i "s|PostDown.*|PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${MAIN_IF} -j MASQUERADE|" /etc/wireguard/wg0.conf
 fi
 
 # بهینه‌سازی شبکه برای اتصال سریع‌تر
@@ -112,6 +119,45 @@ echo "tcp_bbr" >> /etc/modules-load.d/modules.conf 2>/dev/null || true
 sysctl -p > /dev/null 2>&1
 ok "بهینه‌سازی شبکه انجام شد"
 systemctl enable wg-quick@wg0 > /dev/null 2>&1
+
+# ── تنظیم UFW برای WireGuard ─────────────────────────
+step "تنظیم UFW برای WireGuard..."
+
+# سیاست پیش‌فرض FORWARD
+if [[ -f /etc/default/ufw ]]; then
+  sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+fi
+
+# قوانین NAT
+if ! grep -q "WireGuard NAT" /etc/ufw/before.rules 2>/dev/null; then
+  cat >> /etc/ufw/before.rules << UFWEOF
+
+# WireGuard NAT
+*nat
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -s 10.8.0.0/24 -o ${MAIN_IF} -j MASQUERADE
+COMMIT
+UFWEOF
+fi
+
+# پاک کردن قوانین DENY اشتباه که ممکنه پورت 51820 رو ببنده
+ufw delete deny in from 172.16.0.0/12  > /dev/null 2>&1 || true
+ufw delete deny in from 10.0.0.0/8     > /dev/null 2>&1 || true
+ufw delete deny in from 192.168.0.0/16 > /dev/null 2>&1 || true
+ufw delete deny in from 100.64.0.0/10  > /dev/null 2>&1 || true
+
+# پورت‌های ضروری
+ufw allow 22/tcp    > /dev/null 2>&1
+ufw allow 51820/udp > /dev/null 2>&1
+ufw allow 51820/tcp > /dev/null 2>&1
+ufw allow 443/udp   > /dev/null 2>&1
+ufw allow 443/tcp   > /dev/null 2>&1
+
+ufw --force enable > /dev/null 2>&1
+ufw reload         > /dev/null 2>&1
+ok "UFW تنظیم شد — پورت‌های 51820 و 443 باز هستند"
+
+# راه‌اندازی wg0 بعد از UFW
 systemctl restart wg-quick@wg0 2>/dev/null && ok "WireGuard wg0 فعال شد" || warn "wg0 راه‌اندازی نشد"
 
 # ════════════════════════════════════════════════════
@@ -2046,10 +2092,10 @@ ln -sf /etc/nginx/sites-available/wg-panel /etc/nginx/sites-enabled/
 nginx -t && systemctl restart nginx
 ok "Nginx امن آماده شد"
 
-ufw allow 22/tcp >/dev/null 2>&1; ufw allow ${PANEL_PORT}/tcp >/dev/null 2>&1
-ufw allow 443/tcp >/dev/null 2>&1; ufw allow 51820/udp >/dev/null 2>&1
-ufw --force enable >/dev/null 2>&1
-ok "فایروال تنظیم شد"
+# باز کردن پورت پنل مدیریت
+ufw allow ${PANEL_PORT}/tcp > /dev/null 2>&1
+ufw reload > /dev/null 2>&1
+ok "فایروال تنظیم شد — پورت پنل ${PANEL_PORT} باز شد"
 
 finish_gauge
 
